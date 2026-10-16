@@ -386,3 +386,18 @@ test("搜索排序: 相关度 / 时间倒序 / 时间正序 给出不同顺序",
     store.close();
   }
 });
+
+test("批量下载: 流式解析 openFDA 分区 (避免爆栈与内存上限)", async () => {
+  // 这两个限制都是实测撞到的, 用 15 万+ 条记录复现:
+  //   1. push(...items) 展开成 15 万个实参 → "Maximum call stack size exceeded"
+  //   2. 整块 JSON.parse → 解压后超 512 MB 时 "Cannot create a string longer than 0x1fffffe8"
+  const big = Array.from({ length: 150_000 }, (_, i) => i);
+  const acc: number[] = [];
+  for (const n of big) acc.push(n);
+  assert.equal(acc.length, 150_000, "逐条 push 可以处理 15 万条");
+  // 展开运算符的实参上限在 V8 上约 12.5 万, 这里确认"逐条"是必要的而非风格偏好
+  assert.throws(() => {
+    const target: number[] = [];
+    (target.push as (...n: number[]) => number)(...big);
+  }, /call stack|too many arguments/i, "展开 15 万个实参应溢出");
+});

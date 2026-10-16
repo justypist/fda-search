@@ -201,19 +201,26 @@ const main = async (): Promise<number> => {
             maxPartitions: options.limit ?? config.bulk.maxPartitions,
           };
           process.stderr.write(`批量下载: 数据集 ${bulkOptions.datasets.length > 0 ? bulkOptions.datasets.join(", ") : "(全部已配置)"}, 上限 ${bulkOptions.maxPartitions} 个分区\n`);
-          const result = await fetchBulk(client, config.openfda, bulkOptions, progress);
-          const matches = result.items.flatMap((item) =>
-            matchAll(item, config.keywords).map((match) => ({ itemId: item.id, rule: match.rule, field: match.field, term: match.term })),
-          );
-          const committed = store.commitItems(result.items, matches, runId, new Date().toISOString());
+          let inserted = 0;
+          let alerted = 0;
+          // 每个分区下载完立刻落库, 不在内存累积 (单个数据集可有上千万条记录)。
+          const result = await fetchBulk(client, config.openfda, bulkOptions, progress, (items) => {
+            const matches = items.flatMap((item) =>
+              matchAll(item, config.keywords).map((match) => ({ itemId: item.id, rule: match.rule, field: match.field, term: match.term })),
+            );
+            const committed = store.commitItems(items, matches, runId, new Date().toISOString());
+            inserted += committed.inserted;
+            alerted += committed.alerted;
+            return committed;
+          });
           store.finishRun(runId, new Date().toISOString(), {
-            produced: result.items.length,
-            matched: committed.alerted,
+            produced: result.records,
+            matched: alerted,
             fetched: result.downloaded,
           });
           process.stdout.write(
-            `下载 ${result.downloaded} 个分区 (${(result.bytes / 1024 / 1024).toFixed(1)} MB), 跳过 ${result.skipped}, ` +
-              `解析 ${result.items.length} 条, 新增 ${committed.inserted} 条, 命中 ${committed.alerted} 次\n`,
+            `下载 ${result.downloaded} 个分区 (解压 ${(result.bytes / 1024 / 1024).toFixed(1)} MB), 跳过 ${result.skipped}, ` +
+              `解析 ${result.records} 条, 新增 ${inserted} 条, 命中 ${alerted} 次\n`,
           );
           if (result.failures.length > 0) {
             process.stdout.write(`失败 ${result.failures.length} 个分区 (可用 --verbose 重跑查看)\n`);

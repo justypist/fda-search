@@ -261,7 +261,8 @@ export const fetchDataset = async (
       const page = await fetchPage(client, dataset, day, skip, apiKey);
       used += 1;
       if (page.length === 0) break;
-      items.push(...page);
+      // 不写成 push(...page): 展开成实参在数组很大时会爆栈, 见 bulk.ts 的同类修复。
+      for (const item of page) items.push(item);
       skip += page.length;
     }
 

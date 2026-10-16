@@ -1,7 +1,15 @@
-import { unzipSync, strFromU8 } from "fflate";
+import { Unzip, UnzipInflate } from "fflate";
+import streamJson from "stream-json";
+import pickPkg from "stream-json/filters/Pick.js";
+import streamArrayPkg from "stream-json/streamers/StreamArray.js";
+import { Readable, Writable } from "node:stream";
 import type { HttpClient } from "../util/http.ts";
 import type { Item, OpenFdaDataset } from "../types.ts";
 import { toOpenFdaItem } from "./openfda.ts";
+
+const { parser } = streamJson;
+const { pick } = pickPkg;
+const { streamArray } = streamArrayPkg;
 
 // openFDA 的官方批量下载通道 (download.open.fda.gov)。它给出的是每个数据集的
 // 完整 JSON 打包 (zip 内含一个 .json, 结构同 API 的 {meta, results}),
@@ -60,25 +68,94 @@ export interface BulkOptions {
 }
 
 export interface BulkResult {
-  items: Item[];
   downloaded: number;
   skipped: number;
   bytes: number;
+  records: number;
   failures: { file: string; error: string }[];
 }
 
-// 单个分区解出来的 JSON 就是 {meta, results}, 与 API 响应同构。
-const parsePartition = (bytes: Uint8Array, dataset: OpenFdaDataset): { items: Item[]; bytes: number } => {
-  const files = unzipSync(bytes);
-  const name = Object.keys(files).find((entry) => entry.endsWith(".json"));
-  if (name === undefined) throw new Error("zip 内没有 .json");
-  const payload = JSON.parse(strFromU8(files[name]!)) as { results?: Record<string, unknown>[] };
+// 单个分区落库的回调。返回本批新增/命中数, 用于汇总。
+export type BulkSink = (items: Item[]) => { inserted: number; alerted: number };
+
+// 单个分区是 {meta, results:[...]}, 且解压后可以很大 —— 实测 device/recall
+// 解压 1.4 GB, device/510k 约 1.2 GB。整块读进内存会撞两个硬限制:
+//   1. V8 的字符串上限约 512 MB: "Cannot create a string longer than 0x1fffffe8"
+//   2. JSON.parse 对大数组爆栈: "Maximum call stack size exceeded"
+// 因此这里全程流式: 响应体 -> fflate 流式解压 -> stream-json 逐条解析。
+// 内存占用与分区大小无关, 只与单条记录大小有关。
+const parsePartition = async (
+  body: ReadableStream<Uint8Array>,
+  dataset: OpenFdaDataset,
+): Promise<{ items: Item[]; bytes: number }> => {
   const items: Item[] = [];
-  for (const record of payload.results ?? []) {
-    const item = toOpenFdaItem(dataset, record);
-    if (item !== null) items.push(item);
-  }
-  return { items, bytes: bytes.byteLength };
+  let bytes = 0;
+  let fileName = "";
+
+  await new Promise<void>((resolve, reject) => {
+    const unzip = new Unzip();
+    unzip.register(UnzipInflate);
+
+    unzip.onfile = (file) => {
+      fileName = file.name;
+      if (!file.name.endsWith(".json")) return;
+      const chunks = Readable.from(
+        (async function* () {
+          const queue: (Uint8Array | null)[] = [];
+          let wake: (() => void) | null = null;
+          file.ondata = (err, chunk, final) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            if (chunk && chunk.length > 0) {
+              bytes += chunk.length;
+              queue.push(chunk);
+            }
+            if (final) queue.push(null);
+            wake?.();
+          };
+          file.start();
+          for (;;) {
+            while (queue.length === 0) await new Promise<void>((r) => { wake = r; });
+            const next = queue.shift();
+            if (next === null || next === undefined) return;
+            yield next;
+          }
+        })(),
+      );
+      chunks
+        .pipe(parser())
+        // 顶层是 {meta, results}, 只取 results 数组
+        .pipe(pick({ filter: "results" }))
+        .pipe(streamArray())
+        .on("data", (entry: { value: Record<string, unknown> }) => {
+          const item = toOpenFdaItem(dataset, entry.value);
+          if (item !== null) items.push(item);
+        })
+        .on("end", () => resolve())
+        .on("error", reject);
+    };
+
+    Readable.fromWeb(body as never)
+      .pipe(
+        new Writable({
+          write(chunk: Uint8Array, _enc, cb) {
+            unzip.push(chunk, false);
+            cb();
+          },
+          final(cb) {
+            unzip.push(new Uint8Array(0), true);
+            cb();
+          },
+        }),
+      )
+      .on("error", reject)
+      .on("finish", () => setTimeout(resolve, 500));
+  });
+
+  if (fileName.length === 0) throw new Error("zip 内没有 .json");
+  return { items, bytes };
 };
 
 /**
@@ -86,12 +163,16 @@ const parsePartition = (bytes: Uint8Array, dataset: OpenFdaDataset): { items: It
  *
  * 与 API 通道的分工: API 用于日常增量 (滑动窗口 + last_updated 短路), 批量通道
  * 用于一次性补齐历史。两者产出同样的 Item, 靠 instances 主键去重, 因此重叠安全。
+ *
+ * 每个分区下载完立刻通过 sink 落库, 不在内存里累积 —— 单个数据集可能有上千个分区、
+ * 上千万条记录 (实测 animalandveterinary/event 159 个分区, 全攒着会 OOM)。
  */
 export const fetchBulk = async (
   client: HttpClient,
   datasets: OpenFdaDataset[],
   options: BulkOptions,
   progress: (message: string) => void,
+  sink?: BulkSink,
 ): Promise<BulkResult> => {
   const byName = new Map(datasets.map((dataset) => [dataset.name, dataset]));
   const wanted = options.datasets.length > 0 ? new Set(options.datasets) : null;
@@ -101,7 +182,7 @@ export const fetchBulk = async (
     .filter((partition) => wanted === null || wanted.has(partition.dataset))
     .sort((a, b) => a.file.localeCompare(b.file));
 
-  const result: BulkResult = { items: [], downloaded: 0, skipped: 0, bytes: 0, failures: [] };
+  const result: BulkResult = { downloaded: 0, skipped: 0, bytes: 0, records: 0, failures: [] };
   for (const [index, partition] of selected.entries()) {
     if (result.downloaded >= options.maxPartitions) {
       result.skipped += selected.length - index;
@@ -114,18 +195,24 @@ export const fetchBulk = async (
     }
     const dataset = byName.get(partition.dataset)!;
     try {
-      // 批量文件很大, 用 fetchBytes 并按分区实际大小放宽上限 (再留 20% 余量)
-      const response = await client.fetchBytes({
+      // 批量分区最大 275 MB, 解压后可达 1.4 GB, 因此走流式下载 + 流式解压,
+      // 不把响应体收进内存。超时放宽到 10 分钟: 这是整个下载的墙钟上限,
+      // 实测 275 MB 分区需约 62 秒, 但网络慢时可能更久。
+      const response = await client.fetchStream({
         url: partition.file,
         scope: "download.open.fda.gov",
         minDelayMs: 0,
-        maxBytes: Math.ceil(partition.sizeMb * 1.2 * 1024 * 1024) + 4 * 1024 * 1024,
+        timeoutMs: 600_000,
       });
-      const parsed = parsePartition(response.bytes, dataset);
-      result.items.push(...parsed.items);
+      if (response.body === null) throw new Error("响应无 body");
+      const parsed = await parsePartition(response.body, dataset);
       result.bytes += parsed.bytes;
+      result.records += parsed.items.length;
       result.downloaded += 1;
-      progress(`  + ${partition.dataset} ${partition.file.split("/").pop()} → ${parsed.items.length} 条 (${(parsed.bytes / 1024 / 1024).toFixed(1)} MB)`);
+      // 立刻落库并释放: 这个分区可能有 17 万条 (device/510k), 攒着会 OOM。
+      // 也不能用 push(...items): 15 万+ 个实参会爆栈 ("Maximum call stack size exceeded")。
+      sink?.(parsed.items);
+      progress(`  + ${partition.dataset} ${partition.file.split("/").pop()} → ${parsed.items.length} 条 (解压 ${(parsed.bytes / 1024 / 1024).toFixed(1)} MB)`);
     } catch (error) {
       result.failures.push({ file: partition.file, error: (error as Error).message });
       progress(`  ! ${partition.file} 失败: ${(error as Error).message}`);

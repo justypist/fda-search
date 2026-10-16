@@ -28,6 +28,14 @@ export interface BinaryResponse {
   finalUrl: string;
 }
 
+// 流式响应: 调用方拿 body 自己去 pipe, 不必先落进内存。
+// openFDA 的批量分区可达 275 MB (解压后 1.4 GB), 整块缓存是浪费。
+export interface StreamResponse {
+  status: number;
+  body: ReadableStream<Uint8Array> | null;
+  headers: Headers;
+}
+
 export class HttpError extends Error {
   readonly status: number;
   readonly scope: string;
@@ -194,5 +202,31 @@ export class HttpClient {
       }
     }
     throw lastError ?? new Error(`${request.url} 请求失败`);
+  }
+
+  // 流式下载: 不把响应体收进内存, 直接交出 body 供调用方 pipe。
+  // 用于 openFDA 批量分区这类大文件 (最大 275 MB, 解压后 1.4 GB)。
+  //
+  // 超时用 request.timeoutMs 而非配置里的默认值: 配置的 30 秒是按小文本请求设的,
+  // 对流式大文件是整个下载过程的墙钟上限, 275 MB 需要一分多钟, 30 秒必然中断。
+  // 不做重试 —— body 一旦开始消费就无法重放, 重试交由调用方负责。
+  async fetchStream(request: HttpRequest & { timeoutMs?: number }): Promise<StreamResponse> {
+    const scope = request.scope ?? new URL(request.url).host;
+    const minDelayMs = request.minDelayMs ?? (scope.endsWith("fda.gov") ? this.#config.fdaDelayMs : this.#config.minDelayMs);
+    await this.#throttle(scope, minDelayMs);
+    const response = await fetch(request.url, {
+      headers: {
+        "user-agent": this.#config.userAgent,
+        accept: "*/*",
+        ...request.headers,
+      },
+      redirect: "follow",
+      signal: AbortSignal.timeout(request.timeoutMs ?? this.#config.timeoutMs),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new HttpError(`${request.url} 返回 HTTP ${response.status}`, response.status, scope);
+    }
+    return { status: response.status, body: response.body, headers: response.headers };
   }
 }
