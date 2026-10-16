@@ -1,7 +1,7 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import type { Store } from "./db.ts";
+import type { SortMode, Store } from "./db.ts";
 
 export type SearchMode = "web" | "content";
 
@@ -18,6 +18,7 @@ export interface SearchHit {
 export interface SearchResponse {
   query: string;
   mode: SearchMode;
+  sort: SortMode;
   count: number;
   limit: number;
   elapsedMs: number;
@@ -44,6 +45,9 @@ const PAGE_PATH = fileURLToPath(new URL("./web/index.html", import.meta.url));
 
 const asMode = (value: string | null): SearchMode => (value === "content" ? "content" : "web");
 
+const asSort = (value: string | null): SortMode =>
+  value === "newest" || value === "oldest" ? value : "relevance";
+
 const asLimit = (value: string | null, fallback: number): number => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -51,16 +55,22 @@ const asLimit = (value: string | null, fallback: number): number => {
 };
 
 // 两种索引统一成同一个 hit 结构, 前端不必区分来源。
-const fromInstances = (store: Store, query: string, limit: number): SearchHit[] =>
-  store.searchItems(query, limit).map((item) => ({
-    title: item.title.length > 0 ? item.title : item.url,
-    url: item.url,
-    source: item.source,
-    channel: item.channel,
-    date: item.date,
-    kind: "page",
-    snippet: item.summary,
-  }));
+const fromInstances = (store: Store, query: string, limit: number, sort: SortMode): { hits: SearchHit[]; mode: "fts" | "like" } => {
+  const result = store.searchInstances(query, limit, sort);
+  return {
+    mode: result.mode,
+    hits: result.hits.map((hit) => ({
+      title: hit.item.title.length > 0 ? hit.item.title : hit.item.url,
+      url: hit.item.url,
+      source: hit.item.source,
+      channel: hit.item.channel,
+      date: hit.item.date,
+      kind: "page",
+      // 元数据没有正文, 摘要即片段; FTS 模式下用 title/summary 的命中片段
+      snippet: hit.snippet.length > 0 ? hit.snippet : hit.item.summary,
+    })),
+  };
+};
 
 const fromDocuments = (store: Store, query: string, limit: number): SearchHit[] =>
   store.searchDocuments(query, limit).hits.map((hit) => ({
@@ -73,17 +83,18 @@ const fromDocuments = (store: Store, query: string, limit: number): SearchHit[] 
     snippet: hit.snippet,
   }));
 
-export const buildSearch = (store: Store, query: string, mode: SearchMode, limit: number): SearchResponse => {
+export const buildSearch = (store: Store, query: string, mode: SearchMode, limit: number, sort: SortMode = "relevance"): SearchResponse => {
   const started = performance.now();
-  const hits = query.trim().length === 0 ? [] : mode === "content" ? fromDocuments(store, query, limit) : fromInstances(store, query, limit);
+  const empty = query.trim().length === 0;
+  const found = empty
+    ? { hits: [] as SearchHit[], mode: (store.ftsEnabled ? "fts" : "like") as "fts" | "like" }
+    : mode === "content"
+      ? { hits: fromDocuments(store, query, limit), mode: (store.ftsEnabled ? "fts" : "like") as "fts" | "like" }
+      : fromInstances(store, query, limit, sort);
   const elapsedMs = Math.round((performance.now() - started) * 10) / 10;
-  const note =
-    mode === "content"
-      ? store.ftsEnabled
-        ? "全文索引 (FTS5)"
-        : "全文索引不可用, 已降级为 LIKE 扫描"
-      : "标题 / 摘要 / URL";
-  return { query, mode, count: hits.length, limit, elapsedMs, note, hits };
+  const sortLabel = sort === "newest" ? "按时间倒序" : sort === "oldest" ? "按时间正序" : "按相关度 (bm25)";
+  const note = found.mode === "fts" ? `FTS5 · ${sortLabel}` : `LIKE 扫描 (FTS 不可用) · 按时间倒序`;
+  return { query, mode, sort, count: found.hits.length, limit, elapsedMs, note, hits: found.hits };
 };
 
 export const buildStats = (store: Store): StatsResponse => {
@@ -135,7 +146,17 @@ export const serve = (store: Store, options: ServeOptions): Promise<Server> =>
         }
         if (url.pathname === "/api/search") {
           const query = url.searchParams.get("q") ?? "";
-          sendJson(res, 200, buildSearch(store, query, asMode(url.searchParams.get("mode")), asLimit(url.searchParams.get("limit"), options.limit)));
+          sendJson(
+            res,
+            200,
+            buildSearch(
+              store,
+              query,
+              asMode(url.searchParams.get("mode")),
+              asLimit(url.searchParams.get("limit"), options.limit),
+              asSort(url.searchParams.get("sort")),
+            ),
+          );
           return;
         }
         if (url.pathname === "/" || url.pathname === "/index.html") {

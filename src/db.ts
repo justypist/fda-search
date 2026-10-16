@@ -104,11 +104,23 @@ CREATE INDEX IF NOT EXISTS documents_kind_idx ON documents (kind);
 `;
 
 // FTS5 索引单独建: 老版本的 SQLite 可能没编译 FTS5, 届时降级为纯 LIKE 检索而不是启动失败。
+//
+// 元数据 (instances) 也建一份 FTS: 相关度排序需要真正的词频/逆文档频率, LIKE 给不出来。
+// 两者都是 external content 表, 正文不重复存储。
 const FTS_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   title,
   text,
   content='documents',
+  content_rowid='rowid',
+  tokenize='unicode61 remove_diacritics 2'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS instances_fts USING fts5(
+  title,
+  summary,
+  url,
+  channel,
+  content='instances',
   content_rowid='rowid',
   tokenize='unicode61 remove_diacritics 2'
 );
@@ -125,7 +137,23 @@ CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
   INSERT INTO documents_fts (documents_fts, rowid, title, text) VALUES ('delete', old.rowid, old.title, old.text);
   INSERT INTO documents_fts (rowid, title, text) VALUES (new.rowid, new.title, new.text);
 END;
+CREATE TRIGGER IF NOT EXISTS instances_ai AFTER INSERT ON instances BEGIN
+  INSERT INTO instances_fts (rowid, title, summary, url, channel)
+  VALUES (new.rowid, new.title, new.summary, new.url, new.channel);
+END;
+CREATE TRIGGER IF NOT EXISTS instances_ad AFTER DELETE ON instances BEGIN
+  INSERT INTO instances_fts (instances_fts, rowid, title, summary, url, channel)
+  VALUES ('delete', old.rowid, old.title, old.summary, old.url, old.channel);
+END;
+CREATE TRIGGER IF NOT EXISTS instances_au AFTER UPDATE ON instances BEGIN
+  INSERT INTO instances_fts (instances_fts, rowid, title, summary, url, channel)
+  VALUES ('delete', old.rowid, old.title, old.summary, old.url, old.channel);
+  INSERT INTO instances_fts (rowid, title, summary, url, channel)
+  VALUES (new.rowid, new.title, new.summary, new.url, new.channel);
+END;
 `;
+
+export type SortMode = "relevance" | "newest" | "oldest";
 
 export interface RunStats {
   produced: number;
@@ -189,8 +217,46 @@ export class Store {
     try {
       this.#db.exec(FTS_SCHEMA);
       this.#db.exec(FTS_TRIGGERS);
+      this.#backfillFts();
       return true;
     } catch {
+      return false;
+    }
+  }
+
+  // instances_fts 是 external content 表: 索引不会自动建立, 触发器只对之后的新写入生效。
+  // 因此已存在的数据库必须显式 rebuild 一次, 否则永远搜不到。
+  //
+  // 判据不能用 "SELECT COUNT(*) FROM instances_fts" (external content 表的行数是从
+  // content 表代理来的, 建索引前后都等于 instances 的行数, 恒不为 0), 也不能用
+  // "*_data 段数 > 0" (建表时就有 2 个空段)。唯一可靠的判据是: 拿一个必然存在的词
+  // 去 MATCH, 搜不到就说明索引没建。这里用 FTS 表里第一行的某个词做探针。
+  #backfillFts(): void {
+    for (const [fts, source] of [["instances_fts", "instances"], ["documents_fts", "documents"]] as const) {
+      const rows = asRow<Record<string, unknown>>(this.#db.prepare(`SELECT COUNT(*) AS n FROM ${source}`).get());
+      if (num(rows?.n) === 0) continue;
+      if (this.#ftsHasIndex(fts, source)) continue;
+      this.#db.exec(`INSERT INTO ${fts} (${fts}) VALUES ('rebuild')`);
+    }
+  }
+
+  #ftsHasIndex(fts: string, source: string): boolean {
+    // 取 content 表第一行的主键值, 用它当探针查 FTS: 有索引则必能命中, 无则 0。
+    const probe = asRow<Record<string, unknown>>(
+      this.#db.prepare(`SELECT ${source === "instances" ? "id" : "url"} AS key FROM ${source} LIMIT 1`).get(),
+    );
+    const key = str(probe?.key);
+    if (key.length === 0) return true;
+    const terms = key.match(/[\p{L}\p{N}_]+/gu) ?? [];
+    if (terms.length === 0) return true;
+    const expression = terms.map((term) => `"${term}"`).join(" ");
+    try {
+      const hit = asRow<Record<string, unknown>>(
+        this.#db.prepare(`SELECT COUNT(*) AS n FROM ${fts} WHERE ${fts} MATCH ?`).get(expression),
+      );
+      return num(hit?.n) > 0;
+    } catch {
+      // MATCH 不可用 (语法或版本问题) 时按"无索引"处理, 交给 rebuild
       return false;
     }
   }
@@ -637,6 +703,69 @@ export class Store {
     return terms.map((term) => `"${term}"`).join(" ");
   }
 
+  #orderClause(sort: SortMode): string {
+    if (sort === "newest") return "i.published_at DESC";
+    if (sort === "oldest") return "i.published_at ASC";
+    return "rank";
+  }
+
+  // 带命中片段的元数据检索, 供本地搜索界面使用。
+  searchInstances(
+    query: string,
+    limit: number,
+    sort: SortMode,
+  ): { hits: { item: Item; snippet: string; rank: number }[]; mode: "fts" | "like" } {
+    if (query.trim().length === 0) {
+      return {
+        mode: this.#fts ? "fts" : "like",
+        hits: asRows<Record<string, unknown>>(
+          this.#stmt("SELECT raw FROM instances ORDER BY published_at DESC LIMIT ?").all(limit),
+        ).map((row) => ({ item: JSON.parse(str(row.raw)) as Item, snippet: "", rank: 0 })),
+      };
+    }
+
+    if (this.#fts) {
+      const expression = this.#ftsQuery(query);
+      if (expression.length > 0) {
+        try {
+          const rows = asRows<Record<string, unknown>>(
+            this.#stmt(
+              `SELECT i.raw AS raw, bm25(instances_fts, 8.0, 3.0, 2.0, 1.0) AS rank,
+                      snippet(instances_fts, 1, '[', ']', ' … ', 16) AS snippet
+               FROM instances_fts JOIN instances i ON i.rowid = instances_fts.rowid
+               WHERE instances_fts MATCH ?
+               ORDER BY ${this.#orderClause(sort)}, i.published_at DESC
+               LIMIT ?`,
+            ).all(expression, limit),
+          );
+          return {
+            mode: "fts",
+            hits: rows.map((row) => ({
+              item: JSON.parse(str(row.raw)) as Item,
+              snippet: str(row.snippet),
+              rank: Number(row.rank ?? 0),
+            })),
+          };
+        } catch {
+          // 落到 LIKE 兜底
+        }
+      }
+    }
+
+    const like = `%${query.toLowerCase()}%`;
+    const rows = asRows<Record<string, unknown>>(
+      this.#stmt(
+        `SELECT raw FROM instances
+         WHERE LOWER(title) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(url) LIKE ?
+         ORDER BY ${sort === "oldest" ? "published_at ASC" : "published_at DESC"} LIMIT ?`,
+      ).all(like, like, like, limit),
+    );
+    return {
+      mode: "like",
+      hits: rows.map((row) => ({ item: JSON.parse(str(row.raw)) as Item, snippet: "", rank: 0 })),
+    };
+  }
+
   searchDocuments(query: string, limit: number): { hits: DocumentHit[]; mode: "fts" | "like" } {
     if (query.trim().length === 0) {
       const rows = asRows<Record<string, unknown>>(
@@ -721,7 +850,8 @@ export class Store {
     };
   }
 
-  #alertRows(sql: string, args: (string | number)[]): AlertRecord[] {    const rows = asRows<Record<string, unknown>>(this.#stmt(sql).all(...args));
+  #alertRows(sql: string, args: (string | number)[]): AlertRecord[] {
+    const rows = asRows<Record<string, unknown>>(this.#stmt(sql).all(...args));
     return rows.map((row) => ({
       item: JSON.parse(str(row.raw)) as Item,
       rule: str(row.rule),
@@ -747,16 +877,8 @@ export class Store {
     );
   }
 
-  searchItems(query: string, limit: number): Item[] {
-    const like = `%${query.toLowerCase()}%`;
-    const rows = asRows<Record<string, unknown>>(
-      this.#stmt(
-        `SELECT raw FROM instances
-         WHERE LOWER(title) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(url) LIKE ?
-         ORDER BY published_at DESC LIMIT ?`,
-      ).all(like, like, like, limit),
-    );
-    return rows.map((row) => JSON.parse(str(row.raw)) as Item);
+  searchItems(query: string, limit: number, sort: SortMode = "relevance"): { items: Item[]; matched: boolean } {
+    return { items: this.searchInstances(query, limit, sort).hits.map((hit) => hit.item), matched: query.trim().length > 0 };
   }
 
   counts(): { items: number; alerts: number; runs: number } {

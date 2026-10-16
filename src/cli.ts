@@ -317,7 +317,7 @@ const main = async (): Promise<number> => {
       case "search": {
         const query = options.positional.join(" ").trim();
         if (query.length === 0) throw new Error("search 需要一个关键词");
-        const items = store.searchItems(query, 100);
+        const items = store.searchItems(query, 100).items;
         if (options.json) {
           process.stdout.write(`${JSON.stringify(items, null, 2)}\n`);
           return 0;
@@ -347,7 +347,7 @@ const main = async (): Promise<number> => {
       }
       case "tail": {
         const limit = Number(options.positional[0] ?? "20");
-        const items = store.searchItems("", Number.isFinite(limit) && limit > 0 ? limit : 20);
+        const items = store.searchItems("", Number.isFinite(limit) && limit > 0 ? limit : 20).items;
         printItems(items, items.length);
         return 0;
       }

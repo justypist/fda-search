@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -329,6 +330,58 @@ test("搜索: web 模式查元数据, content 模式查正文, 空查询与无�
     const stats = buildStats(store);
     assert.equal(stats.instances, 1);
     assert.equal(stats.documentsWithText, 1);
+  } finally {
+    store.close();
+  }
+});
+
+test("回归: 元数据 FTS 索引必须回填, 否则相关度检索恒返回 0", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ghare-fts-"));
+  const path = join(dir, "t.db");
+  // 第一轮: 写入数据 (触发器建索引)
+  const a = new Store(path);
+  a.commitItems(
+    [
+      { id: "sitemap:a", source: "sitemap", channel: "sitemap:fda.gov", title: "Listeria in soft cheese", summary: "outbreak", url: "https://www.fda.gov/a", date: "2026-01-01T00:00:00.000Z", extra: {} },
+      { id: "sitemap:b", source: "sitemap", channel: "sitemap:fda.gov", title: "Unrelated labeling notice", summary: "", url: "https://www.fda.gov/b", date: "2020-01-01T00:00:00.000Z", extra: {} },
+    ],
+    [], 1, "2026-10-16T00:00:00.000Z",
+  );
+  assert.equal(a.searchInstances("listeria", 10, "relevance").hits.length, 1, "写入时应可用");
+  a.close();
+
+  // 模拟"索引丢失但数据还在": 清空 FTS 索引内容后重新打开, 应自动 rebuild
+  const raw = new DatabaseSync(path);
+  raw.exec("INSERT INTO instances_fts (instances_fts) VALUES ('delete-all')");
+  assert.equal(raw.prepare("SELECT COUNT(*) AS n FROM instances_fts WHERE instances_fts MATCH ?").get('"listeria"').n, 0, "索引应已清空");
+  raw.close();
+
+  const b = new Store(path);
+  try {
+    assert.equal(b.searchInstances("listeria", 10, "relevance").hits.length, 1, "重新打开时应自动回填索引");
+  } finally {
+    b.close();
+  }
+});
+
+test("搜索排序: 相关度 / 时间倒序 / 时间正序 给出不同顺序", () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "ghare-sort-")), "t.db"));
+  try {
+    const make = (id: string, title: string, url: string, date: string): Item => ({
+      id, source: "sitemap", channel: "sitemap:fda.gov", title, summary: "", url, date, extra: {},
+    });
+    store.commitItems(
+      [
+        make("sitemap:old", "Listeria old notice", "https://www.fda.gov/old", "2019-01-01T00:00:00.000Z"),
+        make("sitemap:new", "Listeria new notice", "https://www.fda.gov/new", "2026-01-01T00:00:00.000Z"),
+      ],
+      [], 1, "2026-10-16T00:00:00.000Z",
+    );
+    const first = (sort: "relevance" | "newest" | "oldest"): string =>
+      store.searchInstances("listeria", 10, sort).hits[0]!.item.url;
+    assert.equal(first("newest"), "https://www.fda.gov/new");
+    assert.equal(first("oldest"), "https://www.fda.gov/old");
+    assert.equal(store.searchInstances("listeria", 10, "relevance").hits.length, 2, "相关度模式下两条都在");
   } finally {
     store.close();
   }
