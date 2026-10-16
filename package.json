@@ -1,0 +1,39 @@
+{
+  "name": "fda-search",
+  "version": "1.0.0",
+  "description": "FDA 内容变更监听与全站正文检索: RSS + openFDA + sitemap + 正文库",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "collect": "node src/cli.ts collect",
+    "collect:verbose": "node src/cli.ts collect --verbose",
+    "collect:rss": "node src/cli.ts collect --stage rss",
+    "collect:openfda": "node src/cli.ts collect --stage openfda",
+    "collect:sitemap": "node src/cli.ts collect --stage sitemap",
+    "collect:full": "node src/cli.ts collect --full",
+    "status": "node src/cli.ts status",
+    "alerts": "node src/cli.ts alerts",
+    "tail": "node src/cli.ts tail",
+    "search": "node src/cli.ts search",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "recall": "node src/cli.ts recall",
+    "bulk": "node src/cli.ts bulk"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "fast-xml-parser": "^5.11.2",
+    "fflate": "0.8.3",
+    "pdfjs-dist": "4.10.38"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  },
+  "packageManager": "pnpm@12.11.2"
+}

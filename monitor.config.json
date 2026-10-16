@@ -1,0 +1,85 @@
+{
+  "dataDir": "./data",
+  "notify": ["jsonl"],
+  "stages": [],
+  "maxWork": 2000,
+
+  "keywords": [
+    {
+      "name": "listeria",
+      "any": ["listeria", "listeriosis"],
+      "all": [],
+      "none": [],
+      "regex": [],
+      "caseSensitive": false,
+      "sources": ["rss", "openfda", "sitemap"]
+    },
+    {
+      "name": "sterility",
+      "any": ["sterility", "non-sterile", "nonsterile", "sterile"],
+      "all": [],
+      "none": [],
+      "regex": [],
+      "caseSensitive": false,
+      "sources": ["openfda"]
+    }
+  ],
+
+  "openfda": {
+    "apiKey": "",
+    "rescanHours": 12
+  },
+
+  "sitemap": {
+    "indexUrl": "https://www.fda.gov/sitemap.xml",
+    "include": [
+      "/safety/",
+      "/news-events/",
+      "/drugs/",
+      "/medical-devices/",
+      "/food/",
+      "/biologics/",
+      "/vaccines-blood-biologics/",
+      "/inspections-compliance-enforcement-and-criminal-investigations/",
+      "/tobacco-products/"
+    ],
+    "exclude": ["/media/", "/download"]
+  },
+
+  "content": {
+    "enabled": false,
+    "batchSize": 200,
+    "include": [
+      "/safety/",
+      "/news-events/",
+      "/drugs/",
+      "/medical-devices/",
+      "/food/",
+      "/biologics/",
+      "/vaccines-blood-biologics/",
+      "/inspections-compliance-enforcement-and-criminal-investigations/",
+      "/tobacco-products/",
+      "/media/"
+    ],
+    "exclude": [],
+    "pdf": true,
+    "office": true,
+    "maxBytes": 67108864,
+    "match": false
+  },
+
+  "bulk": {
+    "datasets": [],
+    "maxPartitionMb": 400,
+    "maxPartitions": 4
+  },
+
+  "http": {
+    "userAgent": "fda-search-monitor/1.0 (+contact: set-your-email; respects robots.txt crawl-delay)",
+    "timeoutMs": 30000,
+    "retries": 3,
+    "minDelayMs": 1000,
+    "fdaDelayMs": 30000,
+    "maxBytes": 16777216
+  }
+}

@@ -1,0 +1,290 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Store } from "../src/db.ts";
+import { parseRfc822, parseIsoDate, toCompactDate, toDashedDate } from "../src/util/time.ts";
+import { matchAll } from "../src/util/keyword.ts";
+import { fieldText, pick, stripTags, sha1, truncate } from "../src/util/text.ts";
+import { batchKeyOf } from "../src/pipeline.ts";
+import { parseOpenFdaCursor, formatOpenFdaCursor } from "../src/sources/openfda.ts";
+import { matchesFilter, toSitemapItem } from "../src/sources/sitemap.ts";
+import { decodeEntities, extractHtml, kindFromContentType, normalizeText, officeKindOf, xmlPartsToText } from "../src/content/extract.ts";
+import { OPENFDA_DATASETS } from "../src/defaults.ts";
+import type { Item, KeywordRule } from "../src/types.ts";
+
+const rule = (over: Partial<KeywordRule> = {}): KeywordRule => ({
+  name: "test",
+  any: [],
+  all: [],
+  none: [],
+  regex: [],
+  caseSensitive: false,
+  sources: ["rss", "openfda", "sitemap"],
+  ...over,
+});
+
+const item = (over: Partial<Item> = {}): Item => ({
+  id: "x",
+  source: "rss",
+  channel: "rss:test",
+  title: "",
+  summary: "",
+  url: "",
+  date: null,
+  extra: {},
+  ...over,
+});
+
+test("RFC-822 日期按字面时区缩写换算为 UTC", () => {
+  assert.equal(parseRfc822("Thu, 15 Oct 2026 16:04:00 EDT"), "2026-10-15T20:04:00.000Z");
+  assert.equal(parseRfc822("Thu, 15 Oct 2026 16:04:00 EST"), "2026-10-15T21:04:00.000Z");
+  assert.equal(parseRfc822("Mon, 05 Jan 2026 09:30:00 PST"), "2026-01-05T17:30:00.000Z");
+  assert.equal(parseRfc822("Fri, 16 Oct 2026 00:00:00 GMT"), "2026-10-16T00:00:00.000Z");
+  assert.equal(parseRfc822("Thu, 15 Oct 2026 16:04:00 -0400"), "2026-10-15T20:04:00.000Z");
+});
+
+test("RFC-822 无时区时按 UTC 解释, 非法输入返回 null", () => {
+  // 关键: 不能回退给 new Date() 用服务器本地时区解释, 否则会整体偏移
+  assert.equal(parseRfc822("Thu, 15 Oct 2026 16:04:00"), "2026-10-15T16:04:00.000Z");
+  assert.equal(parseRfc822("15 Oct 2026 16:04:00"), "2026-10-15T16:04:00.000Z");
+  assert.equal(parseRfc822("not a date"), null);
+  assert.equal(parseRfc822(""), null);
+});
+
+test("openFDA 的紧凑与带连字符日期都能解析", () => {
+  assert.equal(parseIsoDate("20261007"), "2026-10-07T00:00:00.000Z");
+  assert.equal(parseIsoDate("2026-10-07"), "2026-10-07T00:00:00.000Z");
+  assert.equal(parseIsoDate(""), null);
+});
+
+test("日期格式化保持 UTC 语义", () => {
+  const at = new Date("2026-10-16T23:30:00.000Z");
+  assert.equal(toCompactDate(at), "20261016");
+  assert.equal(toDashedDate(at), "2026-10-16");
+});
+
+test("关键词 any 命中任意一项即通过, 并记录命中字段", () => {
+  const hits = matchAll(item({ title: "Cheese recalled for Listeria" }), [rule({ any: ["listeria"] })]);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]?.field, "title");
+  assert.equal(hits[0]?.term, "listeria");
+});
+
+test("关键词匹配默认忽略大小写, caseSensitive 时区分", () => {
+  assert.equal(matchAll(item({ title: "LISTERIA" }), [rule({ any: ["listeria"] })]).length, 1);
+  assert.equal(matchAll(item({ title: "LISTERIA" }), [rule({ any: ["listeria"], caseSensitive: true })]).length, 0);
+});
+
+test("all 要求全部命中, none 命中即排除", () => {
+  const target = item({ title: "recall of cheese with listeria" });
+  assert.equal(matchAll(target, [rule({ all: ["recall", "listeria"] })]).length, 1);
+  assert.equal(matchAll(target, [rule({ all: ["recall", "salmonella"] })]).length, 0);
+  assert.equal(matchAll(target, [rule({ any: ["recall"], none: ["cheese"] })]).length, 0);
+});
+
+test("regex 全部需命中, 且不区分大小写", () => {
+  const target = item({ title: "Listeria monocytogenes" });
+  assert.equal(matchAll(target, [rule({ regex: ["listeri[ao]", "monocyto"] })]).length, 2);
+  assert.equal(matchAll(target, [rule({ regex: ["listeri[ao]", "salmonell"] })]).length, 0);
+});
+
+test("无任何正向词的规则不产生命中", () => {
+  assert.equal(matchAll(item({ title: "anything" }), [rule({ none: ["x"] })]).length, 0);
+});
+
+test("规则按 source 限定生效范围", () => {
+  const target = item({ title: "listeria", source: "sitemap" });
+  assert.equal(matchAll(target, [rule({ any: ["listeria"], sources: ["rss"] })]).length, 0);
+  assert.equal(matchAll(target, [rule({ any: ["listeria"], sources: ["sitemap"] })]).length, 1);
+});
+
+test("关键词会匹配 extra 字段", () => {
+  const target = item({ extra: { reason_for_recall: "sterility failure" } });
+  const hits = matchAll(target, [rule({ any: ["sterility"] })]);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0]?.field, "extra.reason_for_recall");
+});
+
+test("pick 支持嵌套路径与数组首元素", () => {
+  const record = { patient: { drug: [{ medicinalproduct: "ASPIRIN" }] }, a: { b: { c: 5 } } };
+  assert.equal(fieldText(record, "patient.drug.medicinalproduct"), "ASPIRIN");
+  assert.equal(pick(record, "a.b.c"), 5);
+  assert.equal(pick(record, "a.missing.c"), undefined);
+});
+
+test("flatten 展开对象为一句话, pick 对数组取首元素再继续下钻", () => {
+  assert.equal(fieldText({ x: { y: "z" } }, "x"), "z");
+  // pick 沿路径遇到数组时取首元素 (openFDA 的 patient.drug 等字段即为此形状)
+  assert.equal(fieldText({ x: ["a", "b"] }, "x"), "a");
+  assert.equal(fieldText({ list: [{ v: "first" }, { v: "second" }] }, "list.v"), "first");
+  assert.equal(fieldText({}, "nope"), "");
+});
+
+test("stripTags 与 truncate 用于 RSS 摘要清洗", () => {
+  assert.equal(stripTags("<p>Hello <b>world</b></p>"), "Hello world");
+  assert.equal(truncate("abcdef", 4), "abc…");
+  assert.equal(truncate("abc", 4), "abc");
+});
+
+test("sha1 稳定且区分内容", () => {
+  assert.equal(sha1("a"), sha1("a"));
+  assert.notEqual(sha1("a"), sha1("b"));
+});
+
+test("回归: 队列键包含内容指纹, 相同游标不同内容不会碰撞", () => {
+  const cursor = "2026-10-17:0:2026-07-18";
+  const batchA = [item({ id: "openfda:x:1" })];
+  const batchB = [item({ id: "openfda:x:2" })];
+  assert.notEqual(batchKeyOf(cursor, batchA), batchKeyOf(cursor, batchB));
+  assert.equal(batchKeyOf(cursor, batchA), batchKeyOf(cursor, batchA));
+});
+
+test("openFDA 游标解析对损坏输入安全回退", () => {
+  const dataset = OPENFDA_DATASETS.find((d) => d.name === "drug/enforcement")!;
+  const now = new Date("2026-10-16T00:00:00.000Z");
+  assert.equal(formatOpenFdaCursor(parseOpenFdaCursor("2026-09-01:200:2026-07-18", dataset, now)), "2026-09-01:200:2026-07-18");
+  // 修复前 count 聚合产出的紧凑日期会写进游标, 必须回退而不是抛错
+  assert.equal(parseOpenFdaCursor("20260814:0:2026-07-18", dataset, now).day, "2026-07-18");
+  assert.equal(parseOpenFdaCursor("garbage", dataset, now).skip, 0);
+});
+
+test("回归: 非法日期应显式报错而不是产出 NaN 游标", async () => {
+  const { addDaysChecked } = await import("../src/sources/openfda.ts");
+  assert.equal(addDaysChecked("2026-08-14", 1), "2026-08-15");
+  assert.throws(() => addDaysChecked("20260814", 1), /非法日期/);
+});
+
+test("sitemap 路径过滤: include 命中且 exclude 优先", () => {
+  const include = ["/safety/", "/drugs/"];
+  const exclude = ["/media/"];
+  assert.equal(matchesFilter("https://www.fda.gov/safety/x", include, exclude), true);
+  assert.equal(matchesFilter("https://www.fda.gov/media/x", include, exclude), false);
+  assert.equal(matchesFilter("https://www.fda.gov/other/x", include, exclude), false);
+  assert.equal(matchesFilter("https://www.fda.gov/anything", [], []), true);
+});
+
+test("sitemap 条目用路径作为标题, 使路径关键词可被匹配", () => {
+  const entry = { loc: "https://www.fda.gov/safety/recalls/listeria-outbreak", lastModified: "2026-10-15T08:16:49-04:00" };
+  const converted = toSitemapItem(entry, "sitemap:fda.gov");
+  assert.equal(converted.title, "/safety/recalls/listeria-outbreak");
+  assert.equal(converted.date, "2026-10-15T12:16:49.000Z");
+  assert.equal(matchAll(converted, [rule({ any: ["listeria"], sources: ["sitemap"] })]).length, 1);
+});
+
+test("回归: 同一篇文章出现在多个 feed 时共享主键, 不重复告警", async () => {
+  const body = (guid: string): string =>
+    `<?xml version="1.0"?><rss xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0"><channel><title>T</title>` +
+    `<item><title>Same article</title><link>http://www.fda.gov/a</link><description>d</description>` +
+    `<pubDate>Thu, 15 Oct 2026 16:04:00 EDT</pubDate><guid isPermaLink="true">${guid}</guid></item></channel></rss>`;
+  const client = (payload: string) => ({
+    fetchText: async () => ({ status: 200, body: payload, headers: new Headers(), notModified: false }),
+  });
+  const { fetchFeed } = await import("../src/sources/rss.ts");
+  const a = await fetchFeed(client(body("http://www.fda.gov/a")) as never, "x", "rss:recalls", null);
+  const b = await fetchFeed(client(body("http://www.fda.gov/a")) as never, "x", "rss:food-safety-recalls", null);
+  // 主键不含通道名, 因此在两个 feed 中指向同一篇文章
+  assert.equal(a.items[0]!.id, b.items[0]!.id);
+});
+
+// --- 正文提取 ---
+
+test("正文提取: 只取 main-content, 丢掉导航/脚本/页脚", () => {
+  const html = `<!doctype html><html><head><title>Listeria Outbreak | FDA</title></head><body>
+<nav>导航文字</nav><article id="main-content"><h1>Listeria Outbreak</h1>
+<p>Soft cheese linked to infections.</p><script>var secret="脚本文字";</script></article>
+<footer>页脚文字</footer></body></html>`;
+  const out = extractHtml(html);
+  assert.equal(out.title, "Listeria Outbreak", "标题取 h1, 且剥掉 '| FDA' 后缀");
+  assert.ok(out.text.includes("Soft cheese"), "正文应保留");
+  assert.ok(!out.text.includes("导航文字"), "nav 不应进正文");
+  assert.ok(!out.text.includes("脚本文字"), "script 不应进正文");
+  assert.ok(!out.text.includes("页脚文字"), "footer 不应进正文");
+});
+
+test("正文提取: HTML 实体解码与空白折叠", () => {
+  // decodeEntities 只负责把实体换成对应字符, 不折叠空白 (那是 normalizeText 的职责)
+  assert.equal(decodeEntities("a &amp; b &lt;c&gt;"), "a & b <c>");
+  assert.equal(decodeEntities("&nbsp;d &#39;e&#39;"), " d 'e'");
+  assert.equal(decodeEntities("&#x41;&#66;"), "AB");
+  assert.equal(normalizeText("  a\n\n\n\nb  "), "a\n\nb");
+  assert.equal(normalizeText(decodeEntities("a &amp;&nbsp;&nbsp;b")), "a & b");
+});
+
+test("正文提取: ld+json 里的 datePublished 被解析成 ISO", () => {
+  const html = `<html><body><article id="main-content"><p>x</p></article>
+<script type="application/ld+json">{"@type":"Article","datePublished":"Thu, 10/15/2026 - 08:00"}</script></body></html>`;
+  const out = extractHtml(html);
+  assert.ok(out.date !== null && out.date.startsWith("2026-10-15"), `应解析出日期, 实得 ${out.date}`);
+});
+
+test("正文提取: content-type 决定解析方式, 未知类型回退到 URL 后缀", () => {
+  assert.equal(kindFromContentType("application/pdf", "https://x/media/1/download"), "pdf");
+  assert.equal(
+    kindFromContentType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "https://x/media/1/download"),
+    "xlsx",
+  );
+  assert.equal(kindFromContentType("text/html; charset=utf-8", "https://x/a"), "html");
+  // FDA 的附件 URL 都是 /media/<id>/download, 没有后缀, 只能靠 content-type
+  assert.equal(kindFromContentType("", "https://x/media/1/download"), "html");
+  assert.equal(kindFromContentType("", "https://x/a/b.pdf"), "pdf");
+});
+
+test("正文提取: Office zip 部件按类型识别", () => {
+  assert.equal(officeKindOf(["xl/workbook.xml", "xl/sharedStrings.xml"]), "xlsx");
+  assert.equal(officeKindOf(["word/document.xml", "[Content_Types].xml"]), "docx");
+  assert.equal(officeKindOf(["ppt/slides/slide1.xml"]), "pptx");
+  assert.equal(officeKindOf(["random.xml"]), "unknown");
+});
+
+test("正文提取: Office XML 文本节点抽出, 段落边界保留换行", () => {
+  const xml = `<w:document><w:body><w:p><w:r><w:t>First para</w:t></w:r></w:p><w:p><w:r><w:t>Second &amp; para</w:t></w:r></w:p></w:body></w:document>`;
+  const text = xmlPartsToText([xml]);
+  assert.ok(text.includes("First para") && text.includes("Second & para"), text);
+  assert.ok(text.includes("\n"), "段落之间应有换行");
+});
+
+// --- 正文抓取的排序与 lastmod 刷新 ---
+
+test("回归: sitemap 重扫时 lastmod 前进必须刷新, 否则倒序抓取会用旧时间排序", () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "fda-search-lastmod-")), "t.db"));
+  try {
+    const make = (id: string, url: string, date: string): Item => ({
+      id, source: "sitemap", channel: "sitemap:fda.gov", title: url, summary: "", url, date, extra: {},
+    });
+    // A 首次采到时 lastmod 是 2020
+    store.commitItems([make("sitemap:a", "https://www.fda.gov/a", "2020-01-01T00:00:00.000Z")], [], 1, "2026-10-16T00:00:00.000Z");
+    // B 的 lastmod 是 2025
+    store.commitItems([make("sitemap:b", "https://www.fda.gov/b", "2025-06-01T00:00:00.000Z")], [], 1, "2026-10-16T00:00:00.000Z");
+    // A 重扫, lastmod 前进到 2026 —— 若不刷新 published_at, A 仍会排在 B 之后
+    store.commitItems([make("sitemap:a", "https://www.fda.gov/a", "2026-10-15T00:00:00.000Z")], [], 1, "2026-10-16T01:00:00.000Z");
+    const order = store.pendingDocumentUrls({ include: [], exclude: [] }, 10).map((u) => u.split("/").pop());
+    assert.deepEqual(order, ["a", "b"], "A 的 lastmod 前进后应排到最前");
+  } finally {
+    store.close();
+  }
+});
+
+test("正文待抓列表按 lastmod 倒序, published_at 为空的排最后", () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "fda-search-order-")), "t.db"));
+  try {
+    const make = (id: string, url: string, date: string | null): Item => ({
+      id, source: "sitemap", channel: "sitemap:fda.gov", title: url, summary: "", url, date, extra: {},
+    });
+    store.commitItems(
+      [
+        make("sitemap:a", "https://www.fda.gov/old", "2020-01-01T00:00:00.000Z"),
+        make("sitemap:b", "https://www.fda.gov/new", "2026-10-15T00:00:00.000Z"),
+        make("sitemap:c", "https://www.fda.gov/none", null),
+      ],
+      [],
+      1,
+      "2026-10-16T00:00:00.000Z",
+    );
+    const order = store.pendingDocumentUrls({ include: [], exclude: [] }, 10).map((u) => u.split("/").pop());
+    assert.deepEqual(order, ["new", "old", "none"], "应按 lastmod 倒序, 无 lastmod 的排最后");
+  } finally {
+    store.close();
+  }
+});
