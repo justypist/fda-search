@@ -6,6 +6,7 @@ import { HttpClient } from "./util/http.ts";
 import { acquireLock } from "./util/lock.ts";
 import { runCollect } from "./pipeline.ts";
 import { fetchBulk } from "./sources/bulk.ts";
+import { serve } from "./server.ts";
 import { matchAll } from "./util/keyword.ts";
 import { notifierNames } from "./notify/index.ts";  // 该模块内部已引入全部内置通道
 import type { Alert } from "./pipeline.ts";
@@ -18,6 +19,7 @@ const USAGE = `FDA 变更监听
 命令:
   collect              拉取各通道并把新条目落库, 命中关键词时输出
   bulk                 走 openFDA 官方批量下载通道补历史 (不受 API 配额限制)
+  serve                启动本地搜索界面 (只监听回环地址)
   status               显示运行历史、游标、队列与库内统计
   alerts               列出历史告警
   search <关键词>      在已落库条目中检索
@@ -30,7 +32,8 @@ const USAGE = `FDA 变更监听
       --full           忽略条件请求缓存, 强制全量拉取 (sitemap / 正文)
       --max-work <n>   本轮最多处理的队列条数 (默认取配置)
       --dataset <名称> bulk 限定数据集, 可重复 (默认取配置)
-      --limit <n>      bulk 单轮最多下多少个分区 (默认取配置)
+      --limit <n>      bulk 单轮最多下多少个分区 / serve 单页结果上限
+      --port <n>       serve 监听端口 (默认 8787)
   -v, --verbose        输出每个通道的明细
   -h, --help           显示帮助
 
@@ -46,6 +49,7 @@ interface CliOptions {
   maxWork: number | null;
   datasets: string[];
   limit: number | null;
+  port: number | null;
   verbose: boolean;
   json: boolean;
 }
@@ -63,6 +67,7 @@ const parse = (argv: string[]): CliOptions => {
       "max-work": { type: "string" },
       dataset: { type: "string", multiple: true, default: [] },
       limit: { type: "string" },
+      port: { type: "string" },
       verbose: { type: "boolean", short: "v", default: false },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -75,6 +80,10 @@ const parse = (argv: string[]): CliOptions => {
   const limit = values.limit === undefined ? null : Number(values.limit);
   if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
     throw new Error(`--limit 需要正整数, 收到 ${values.limit}`);
+  }
+  const port = values.port === undefined ? null : Number(values.port);
+  if (port !== null && (!Number.isInteger(port) || port < 1 || port > 65535)) {
+    throw new Error(`--port 需要 1-65535 的整数, 收到 ${values.port}`);
   }
   // 打错的通道名必须报错。若静默丢弃, stages 会变空, 于是跑起全部通道 ——
   // 与"只跑指定通道"的意图正好相反, 对 fda.gov 意味着多出 20 多分钟的请求。
@@ -92,6 +101,7 @@ const parse = (argv: string[]): CliOptions => {
     maxWork,
     datasets: values.dataset ?? [],
     limit,
+    port,
     verbose: values.verbose === true,
     json: values.json === true,
   };
@@ -120,7 +130,7 @@ const printItems = (items: Item[], limit: number): void => {
   }
 };
 
-const COMMANDS = ["collect", "bulk", "status", "alerts", "search", "recall", "tail", "help"] as const;
+const COMMANDS = ["collect", "bulk", "serve", "status", "alerts", "search", "recall", "tail", "help"] as const;
 type Command = (typeof COMMANDS)[number];
 
 const isCommand = (value: string): value is Command => (COMMANDS as readonly string[]).includes(value);
@@ -212,6 +222,24 @@ const main = async (): Promise<number> => {
         } finally {
           lock.release();
         }
+        return 0;
+      }
+      case "serve": {
+        const port = options.port ?? 8787;
+        const server = await serve(store, { port, host: "127.0.0.1", limit: options.limit ?? 50 });
+        const counts = store.counts();
+        process.stdout.write(`本地搜索界面: http://127.0.0.1:${port}\n`);
+        process.stdout.write(
+          `索引 ${counts.items} 条元数据, 正文 ${store.documentStats().ok} 篇${store.ftsEnabled ? "" : " (FTS5 不可用)"}\n`,
+        );
+        process.stdout.write("Ctrl-C 退出\n");
+        await new Promise<void>((resolve) => {
+          const stop = (): void => {
+            server.close(() => resolve());
+          };
+          process.on("SIGINT", stop);
+          process.on("SIGTERM", stop);
+        });
         return 0;
       }
       case "status": {

@@ -21,7 +21,8 @@
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "recall": "node src/cli.ts recall",
-    "bulk": "node src/cli.ts bulk"
+    "bulk": "node src/cli.ts bulk",
+    "serve": "node src/cli.ts serve"
   },
   "keywords": [],
   "author": "",

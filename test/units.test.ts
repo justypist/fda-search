@@ -11,6 +11,7 @@ import { batchKeyOf } from "../src/pipeline.ts";
 import { parseOpenFdaCursor, formatOpenFdaCursor } from "../src/sources/openfda.ts";
 import { matchesFilter, toSitemapItem } from "../src/sources/sitemap.ts";
 import { decodeEntities, extractHtml, kindFromContentType, normalizeText, officeKindOf, xmlPartsToText } from "../src/content/extract.ts";
+import { buildSearch, buildStats } from "../src/server.ts";
 import { OPENFDA_DATASETS } from "../src/defaults.ts";
 import type { Item, KeywordRule } from "../src/types.ts";
 
@@ -284,6 +285,50 @@ test("正文待抓列表按 lastmod 倒序, published_at 为空的排最后", ()
     );
     const order = store.pendingDocumentUrls({ include: [], exclude: [] }, 10).map((u) => u.split("/").pop());
     assert.deepEqual(order, ["new", "old", "none"], "应按 lastmod 倒序, 无 lastmod 的排最后");
+  } finally {
+    store.close();
+  }
+});
+
+// --- 本地搜索界面 (serve) 的查询逻辑 ---
+
+test("搜索: web 模式查元数据, content 模式查正文, 空查询与无命中都返回 0", () => {
+  const store = new Store(join(mkdtempSync(join(tmpdir(), "ghare-serve-")), "t.db"));
+  try {
+    store.commitItems(
+      [
+        {
+          id: "sitemap:x", source: "sitemap", channel: "sitemap:fda.gov",
+          title: "/safety/recalls/listeria-outbreak", summary: "", date: "2026-10-15T00:00:00.000Z",
+          url: "https://www.fda.gov/safety/recalls/listeria-outbreak", extra: {},
+        },
+      ],
+      [], 1, "2026-10-16T00:00:00.000Z",
+    );
+    store.saveDocument({
+      url: "https://www.fda.gov/safety/recalls/listeria-outbreak", kind: "html", title: "Listeria Outbreak",
+      text: "The FDA investigated Listeria monocytogenes in soft cheese.", bytes: 100,
+      etag: null, lastModified: null, fetchedAt: "2026-10-16T00:00:00.000Z", error: null,
+    });
+
+    const web = buildSearch(store, "listeria", "web", 10);
+    assert.equal(web.count, 1);
+    assert.equal(web.hits[0]!.kind, "page");
+
+    // 正文模式能命中只在正文里出现的词 (URL 里没有)
+    const content = buildSearch(store, "monocytogenes", "content", 10);
+    assert.equal(content.count, 1);
+    assert.equal(content.hits[0]!.title, "Listeria Outbreak");
+    assert.ok(content.hits[0]!.snippet.includes("["), "应带命中标记");
+
+    // web 模式搜不到只在正文里的词, 这正说明两种索引是分开的
+    assert.equal(buildSearch(store, "monocytogenes", "web", 10).count, 0);
+    assert.equal(buildSearch(store, "   ", "content", 10).count, 0, "空查询不返回全部");
+    assert.equal(buildSearch(store, "zzz-nope", "content", 10).count, 0);
+
+    const stats = buildStats(store);
+    assert.equal(stats.instances, 1);
+    assert.equal(stats.documentsWithText, 1);
   } finally {
     store.close();
   }

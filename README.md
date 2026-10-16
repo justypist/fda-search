@@ -125,6 +125,7 @@ openFDA 的日期字段是**报告日期**, 而记录会被持续补录到历史
 ```bash
 pnpm install
 pnpm run collect              # 跑全部通道
+pnpm run serve                # 启动本地搜索界面 (http://127.0.0.1:8787)
 pnpm run status               # 查看运行历史 / 游标 / 队列 / 正文库
 pnpm run alerts               # 历史告警
 pnpm run search <关键词>       # 在已落库条目中检索 (标题 / 摘要 / URL)
@@ -135,6 +136,26 @@ pnpm run typecheck            # 类型检查
 
 要求 Node >= 24 (使用原生 TypeScript 类型剥离与 `node:sqlite`, 无构建步骤, 无第三方运行时框架)。
 正文通道额外依赖 `pdfjs-dist` (PDF) 与 `fflate` (Office 文档解压)。
+
+### 本地搜索界面
+
+`pnpm run serve` 起一个只监听 `127.0.0.1` 的小服务, 用来查"本地索引到了什么"。两种模式:
+
+| 模式 | 索引 | 能搜到 |
+| --- | --- | --- |
+| 网页元数据 | `instances` 表 | 标题 / 摘要 / URL (全部通道的条目) |
+| 正文全文 | `documents` 表 + FTS5 | 页面与附件的正文, 带命中高亮 |
+
+支持 `?q=关键词` 直接带查询进来, 便于生成可复现的对比链接:
+
+```bash
+pnpm run serve --port 8788 --limit 100
+open 'http://127.0.0.1:8787/?q=listeria'
+```
+
+> **关于"和官方搜索对比"**: 做不到, 因为官方站内搜索已关停 —— `fda.gov/search` 返回
+> WAF 挑战页, Search.gov 的 `affiliate=fda` 结果页显示 "This search page has been turned
+> off"。因此本界面只反映本地索引, 不对照官方结果。界面里也没有伪造官方结果的部分。
 
 ## 配置
 
@@ -191,12 +212,15 @@ pnpm run typecheck            # 类型检查
 ```bash
 node src/cli.ts <命令> [选项]
 
-命令: collect | status | alerts [n] | search <关键词> | recall <关键词> | tail [n]
+命令: collect | bulk | serve | status | alerts [n] | search <关键词> | recall <关键词> | tail [n]
 
 -c, --config <路径>   配置文件 (默认 ./monitor.config.json)
     --stage <名称>    仅跑指定通道, 可重复: rss | openfda | sitemap (正文随 sitemap)
     --full            忽略条件请求缓存, 强制全量重拉; 同时解除正文的 batchSize 限制
     --max-work <n>    本轮最多处理的队列条数 (默认取配置)
+    --dataset <名称>  bulk 限定数据集, 可重复 (默认取配置)
+    --limit <n>       bulk 单轮最多下多少个分区 / serve 单页结果上限
+    --port <n>        serve 监听端口 (默认 8787)
 -v, --verbose         输出每个通道的明细
     --json            status / alerts / search / recall 输出 JSON
 ```
@@ -211,7 +235,7 @@ node src/cli.ts <命令> [选项]
 ## 测试
 
 ```bash
-pnpm test        # 37 项, node:test, 不联网
+pnpm test        # 40 项, node:test, 不联网
 ```
 
 - `test/units.test.ts` — 日期解析 (RFC-822 时区/紧凑与带连字符日期)、关键词规则
@@ -224,6 +248,8 @@ pnpm test        # 37 项, node:test, 不联网
   条件请求短路、条目与告警的幂等性、feed 更新后新条目恰好告警一次、`guid` 去重优先级,
   以及正文通道 (抓取落库、FTS 可检索、重复运行不重抓、过滤条件下推到 SQL)。
 - `test/lock.test.ts` — 单实例锁的获取/重入拒绝/陈旧锁接管。
+- 搜索界面的查询逻辑 (`buildSearch` / `buildStats`) 在 `test/units.test.ts` 内一并覆盖:
+  两种模式互不串味 (只在正文里的词, 元数据模式搜不到)、空查询不返回全部、无命中返回 0。
 
 ## 架构
 

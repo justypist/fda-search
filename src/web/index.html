@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FDA Search — 本地索引</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --ink: #1b1f24;
+    --muted: #5c6672;
+    --line: #dfe3e8;
+    --brand: #1a4480;
+    --brand-soft: #e8eef7;
+    --warn: #8a5a00;
+    --warn-bg: #fff6e0;
+    --hit: #ffe9a8;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171b; --panel: #1c2026; --ink: #e6e9ee; --muted: #98a2b0;
+      --line: #2b3138; --brand: #7aa7e0; --brand-soft: #212a36;
+      --warn: #e0b355; --warn-bg: #2c2717; --hit: #5a4a1c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  .gov {
+    background: #f0f0f0; color: #1b1f24; font-size: 12px; padding: 4px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  @media (prefers-color-scheme: dark) { .gov { background: #23262b; color: #cfd4da; } }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 16px; }
+  .gov .wrap { display: flex; align-items: center; gap: 8px; }
+  .gov .flag { font-size: 14px; }
+  header.site { background: var(--brand); color: #fff; padding: 14px 0; }
+  header.site .wrap { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header.site h1 { font-size: 19px; margin: 0; font-weight: 600; letter-spacing: .01em; }
+  header.site .tag {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    background: rgba(255,255,255,.16); padding: 3px 8px; border-radius: 3px;
+  }
+  .searchbar { padding: 18px 0 6px; }
+  form.search { display: flex; gap: 8px; flex-wrap: wrap; }
+  input[type=search] {
+    flex: 1 1 380px; min-width: 0; padding: 11px 13px; font-size: 16px;
+    border: 1px solid var(--line); border-radius: 4px; background: var(--panel); color: var(--ink);
+  }
+  input[type=search]:focus { outline: 2px solid var(--brand); outline-offset: -1px; border-color: var(--brand); }
+  button {
+    padding: 11px 20px; font-size: 15px; font-weight: 600; color: #fff;
+    background: var(--brand); border: 1px solid var(--brand); border-radius: 4px; cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button.ghost { background: transparent; color: var(--brand); }
+  .controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .stats { font-size: 12px; color: var(--muted); margin-top: 8px; font-family: var(--mono); }
+  .stats b { color: var(--ink); font-weight: 600; }
+  main { padding: 8px 0 60px; }
+  .bar {
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+    padding: 12px 14px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; margin-bottom: 14px; font-size: 13px;
+  }
+  .bar .count { font-weight: 600; }
+  .bar .note { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+  .bar .spacer { flex: 1; }
+  .notice {
+    background: var(--warn-bg); color: var(--warn); border: 1px solid var(--warn);
+    border-radius: 4px; padding: 10px 13px; font-size: 13px; margin-bottom: 14px;
+  }
+  ol.hits { list-style: none; margin: 0; padding: 0; }
+  ol.hits > li {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 14px 16px; margin-bottom: 10px;
+  }
+  .hit-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+  .badge {
+    font-size: 10px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600;
+    padding: 2px 7px; border-radius: 3px; background: var(--brand-soft); color: var(--brand);
+  }
+  .badge.kind-pdf { background: #fde8e8; color: #a01b1b; }
+  .badge.kind-xlsx, .badge.kind-docx, .badge.kind-pptx { background: #e6f4ea; color: #1a6b34; }
+  @media (prefers-color-scheme: dark) {
+    .badge.kind-pdf { background: #3a1f1f; color: #e88; }
+    .badge.kind-xlsx, .badge.kind-docx, .badge.kind-pptx { background: #17301f; color: #7fd39a; }
+  }
+  .hit-date { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  h3.hit-title { margin: 0 0 5px; font-size: 17px; font-weight: 600; line-height: 1.35; }
+  h3.hit-title a { color: var(--brand); text-decoration: none; }
+  h3.hit-title a:hover { text-decoration: underline; }
+  .hit-url {
+    font-family: var(--mono); font-size: 12px; color: var(--muted);
+    word-break: break-all; margin-bottom: 6px;
+  }
+  .hit-snippet { font-size: 14px; color: var(--ink); opacity: .88; }
+  .hit-snippet mark { background: var(--hit); color: inherit; padding: 0 2px; border-radius: 2px; }
+  .empty { text-align: center; color: var(--muted); padding: 48px 16px; }
+  .empty code { font-family: var(--mono); background: var(--panel); padding: 2px 6px; border-radius: 3px; border: 1px solid var(--line); }
+  .footer { font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); padding: 14px 0 30px; }
+  .footer code { font-family: var(--mono); }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin .7s linear infinite; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<div class="gov"><div class="wrap"><span class="flag">🇺🇸</span><span>本地索引界面 · 非 FDA 官方站点</span></div></div>
+
+<header class="site">
+  <div class="wrap">
+    <h1>FDA Search</h1>
+    <span class="tag">本地索引</span>
+  </div>
+</header>
+
+<div class="wrap searchbar">
+  <form class="search" id="form">
+    <input type="search" id="q" placeholder="搜索 FDA 内容…" autocomplete="off" autofocus>
+    <button type="submit" id="go">搜索</button>
+    <button type="button" class="ghost" id="clear">清空</button>
+  </form>
+  <div class="controls">
+    <label><input type="radio" name="mode" value="web" checked> 网页元数据 (标题/摘要/URL)</label>
+    <label><input type="radio" name="mode" value="content"> 正文全文 (FTS5)</label>
+    <label>上限 <input type="number" id="limit" value="50" min="1" max="200" style="width:64px;padding:3px 6px;border:1px solid var(--line);border-radius:3px;background:var(--panel);color:var(--ink)"></label>
+  </div>
+  <div class="stats" id="stats">加载中…</div>
+</div>
+
+<main class="wrap">
+  <div id="notice"></div>
+  <div id="results"></div>
+</main>
+
+<div class="wrap footer">
+  数据来自本地 SQLite。官方站内搜索已关停 (<code>fda.gov/search</code> 被 WAF 拦截,
+  Search.gov 的 <code>affiliate=fda</code> 页面显示 turned off), 因此本页只反映本地索引内容。
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// 后端返回的 snippet 用 [..] 标记命中词 (FTS5 的 snippet 函数), 这里转成 <mark>。
+// 先整体转义再替换, 避免把摘要里的 HTML 当标签渲染。
+const highlight = (s) => esc(s).replace(/\[([^\]]+)\]/g, "<mark>$1</mark>");
+
+const mode = () => document.querySelector('input[name=mode]:checked').value;
+
+const loadStats = async () => {
+  try {
+    const s = await (await fetch("/api/stats")).json();
+    const src = s.bySource.map((r) => `${r.source} ${r.count}`).join(" · ");
+    const kinds = s.byKind.length ? ` ｜ 正文类型: ${s.byKind.map((k) => `${k.kind} ${k.count}`).join(", ")}` : "";
+    $("stats").innerHTML =
+      `索引: <b>${s.instances.toLocaleString()}</b> 条元数据 · ` +
+      `正文 <b>${s.documentsWithText.toLocaleString()}</b> 篇${s.documents > s.documentsWithText ? ` (失败 ${s.documents - s.documentsWithText})` : ""}` +
+      ` ｜ 全文索引 ${s.ftsEnabled ? "可用" : "不可用"}<br>${src}${kinds}`;
+  } catch (e) {
+    $("stats").textContent = "统计加载失败: " + e.message;
+  }
+};
+
+const renderHits = (data) => {
+  const bar = `<div class="bar">
+      <span class="count">${data.count} 条结果</span>
+      <span class="note">${esc(data.note)} · ${data.elapsedMs} ms</span>
+      <span class="spacer"></span>
+      <span class="note">上限 ${data.limit}</span>
+    </div>`;
+  if (data.count === 0) {
+    $("results").innerHTML = bar + `<div class="empty">没有匹配 <code>${esc(data.query)}</code></div>`;
+    return;
+  }
+  const items = data.hits.map((h, i) => {
+    const date = h.date ? `<span class="hit-date">${esc(h.date.slice(0, 10))}</span>` : "";
+    const kind = h.kind && h.kind !== "page" ? `<span class="badge kind-${esc(h.kind)}">${esc(h.kind)}</span>` : "";
+    const snippet = h.snippet ? `<div class="hit-snippet">${highlight(h.snippet)}</div>` : "";
+    return `<li>
+      <div class="hit-head"><span class="badge">${i + 1}</span>${kind}${date}<span class="hit-date">${esc(h.channel)}</span></div>
+      <h3 class="hit-title"><a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.title)}</a></h3>
+      <div class="hit-url">${esc(h.url)}</div>
+      ${snippet}
+    </li>`;
+  }).join("");
+  $("results").innerHTML = bar + `<ol class="hits">${items}</ol>`;
+};
+
+const runSearch = async (query) => {
+  if (!query.trim()) { $("results").innerHTML = ""; $("notice").innerHTML = ""; return; }
+  $("results").innerHTML = `<div class="empty"><span class="spinner"></span> 搜索中…</div>`;
+  const params = new URLSearchParams({ q: query, mode: mode(), limit: $("limit").value });
+  try {
+    const data = await (await fetch("/api/search?" + params)).json();
+    if (data.error) throw new Error(data.error);
+    $("notice").innerHTML = "";
+    renderHits(data);
+    // 正文库为空时给出明确提示, 否则用户会以为搜索坏了
+    if (data.mode === "content" && data.count === 0 && data.note.includes("FTS5")) {
+      $("notice").innerHTML = `正文库还没有内容 (抓取默认关闭)。先用 <code>pnpm run collect:sitemap</code> 抓一批, 见 README 的「正文通道」一节。`;
+    }
+  } catch (e) {
+    $("results").innerHTML = `<div class="empty">搜索失败: ${esc(e.message)}</div>`;
+  }
+};
+
+let timer = null;
+$("q").addEventListener("input", (e) => {
+  clearTimeout(timer);
+  const v = e.target.value;
+  timer = setTimeout(() => runSearch(v), 280);
+});
+$("form").addEventListener("submit", (e) => { e.preventDefault(); runSearch($("q").value); });
+$("clear").addEventListener("click", () => { $("q").value = ""; $("results").innerHTML = ""; $("notice").innerHTML = ""; $("q").focus(); });
+for (const r of document.querySelectorAll('input[name=mode]')) r.addEventListener("change", () => runSearch($("q").value));
+
+// 支持 ?q= 直接带查询进来, 便于从命令行生成可复现的对比链接
+const initial = new URLSearchParams(location.search).get("q");
+if (initial) { $("q").value = initial; runSearch(initial); }
+loadStats();
+</script>
+</body>
+</html>

@@ -769,4 +769,10 @@ export class Store {
     );
     return { items: num(row?.items), alerts: num(row?.alerts), runs: num(row?.runs) };
   }
+
+  countBySource(): { source: string; count: number }[] {
+    return asRows<Record<string, unknown>>(
+      this.#stmt("SELECT source, COUNT(*) AS n FROM instances GROUP BY source ORDER BY n DESC").all(),
+    ).map((row) => ({ source: str(row.source), count: num(row.n) }));
+  }
 }
