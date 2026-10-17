@@ -1,4 +1,9 @@
+// 拼 feed 地址用的路径前缀, 形如 <RSS_BASE>/<feed-id>/rss.xml。该目录本身返回 404,
+// 但每个子路径均实测 200, 不要改成"订阅总览页"(换成它会把所有 feed 拼成 404)。
 export const RSS_BASE = "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds";
+
+// 给人看的订阅总览页, 列出全部 16 个 feed (上方 FEEDS 与之保持一致)。
+export const RSS_INDEX_URL = "https://www.fda.gov/about-fda/contact-fda/subscribe-podcasts-and-news-feeds";
 
 export const FEEDS: string[] = [
   "press-releases",

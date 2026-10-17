@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/db.ts";
 import { runCollect } from "../src/pipeline.ts";
+import { HttpError } from "../src/util/http.ts";
 import { OPENFDA_DATASETS } from "../src/defaults.ts";
 import "../src/notify/index.ts";
 import type { Config, Item } from "../src/types.ts";
@@ -59,15 +60,17 @@ interface Harness {
   stub: {
     fetchText: (request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>;
     fetchJson: (request: { url: string }) => Promise<unknown>;
-    fetchBytes: (request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>;
+    fetchBytesDirect: (request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>;
   };
   setLastUpdated: (value: string) => void;
+  setBytesResponse: (response: (request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>) => void;
   counts: () => { text: number; json: number };
 }
 
 const makeHarness = (): Harness => {
   const dir = mkdtempSync(join(tmpdir(), "fda-search-e2e-"));
   let lastUpdated = "2026-10-07";
+  let bytesOverride: ((request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>) | null = null;
   const counts = { text: 0, json: 0 };
   const dataset = OPENFDA_DATASETS.find((d) => d.name === "drug/enforcement")!;
 
@@ -82,11 +85,17 @@ const makeHarness = (): Harness => {
     content: {
       enabled: false,
       batchSize: 100,
+      concurrency: 1,
+      minIntervalMs: 0,
+      backoffMs: 0,
       include: [],
       exclude: [],
       pdf: true,
       office: true,
       maxBytes: 1e7,
+      ocr: false,
+      ocrMaxPages: 8,
+      ocrConcurrency: 4,
       match: false,
     },
     bulk: { datasets: [], maxPartitionMb: 400, maxPartitions: 4 },
@@ -114,6 +123,9 @@ const makeHarness = (): Harness => {
     counts: () => ({ ...counts }),
     setLastUpdated: (value: string) => {
       lastUpdated = value;
+    },
+    setBytesResponse: (response: (request: { url: string; conditional?: { lastModified: string | null } }) => Promise<unknown>) => {
+      bytesOverride = response;
     },
     stub: {
       // 与真实服务端一致: 仅当 If-Modified-Since 等于该资源当前 Last-Modified 时返回 304
@@ -149,7 +161,9 @@ const makeHarness = (): Harness => {
       },
       // 正文通道走字节流: 用一段带 <article id="main-content"> 的 HTML 验证
       // 正文抽取、字符数与 304 刷新路径。
-      fetchBytes: async ({ url, conditional }) => {
+      fetchBytesDirect: async (request: { url: string; conditional?: { lastModified: string | null } }) => {
+        if (bytesOverride !== null) return bytesOverride(request);
+        const { url, conditional } = request;
         const etag = '"v1"';
         if (conditional?.lastModified === PAGE_LAST_MODIFIED) {
           return { status: 304, bytes: new Uint8Array(0), headers: new Headers({ etag }), notModified: true, finalUrl: url };
@@ -347,4 +361,69 @@ test("正文通道: 过滤条件下推到 SQL, 窄 include 也能推进 (回归)
   assert.ok(notice.includes("抓取 1 篇"), `应抓到 media 那条而不是空转: ${notice}`);
   const rows = h.store.searchDocuments("", 10).hits;
   assert.ok(rows.every((row) => row.url.includes("/media/")), "只应抓 include 命中的 URL");
+});
+
+test("正文通道: 被限流时该 URL 不落库, 保持待抓而不是记成失败", async () => {
+  const h = makeHarness();
+  cleanup.push(() => {
+    h.store.close();
+    rmSync(h.dir, { recursive: true, force: true });
+  });
+
+  await runCollect(h.config, h.store, h.stub as never, "2026-10-16T00:00:00.000Z", { full: false, maxWork: 1000, progress: () => {} });
+  assert.equal(h.store.pendingDocumentCount(), 1);
+
+  // FDA 的限流页: 403 + excessive-requests-apology (见 HttpError 的 body 保留逻辑)
+  h.setBytesResponse(async () => {
+    throw new HttpError("https://www.fda.gov/safety/x 返回 HTTP 403", 403, "fda.gov", "excessive-requests-apology");
+  });
+  h.config.content.enabled = true;
+
+  const run = await runCollect(h.config, h.store, h.stub as never, "2026-10-16T01:00:00.000Z", { full: false, maxWork: 1000, progress: () => {} });
+  const notice = run.perStage.at(-1)!.notice;
+  assert.ok(notice.includes("限流推迟 1"), notice);
+  assert.ok(notice.includes("失败 0"), `限流不应计为失败: ${notice}`);
+  assert.equal(h.store.pendingDocumentCount(), 1, "被限流的 URL 必须保持待抓");
+  assert.equal(h.store.documentStats().total, 0, "被限流的 URL 不应留下错误行");
+
+  // 限流解除后同一 URL 能被正常抓到
+  h.setBytesResponse(async () => {
+    const bytes = new TextEncoder().encode(PAGE_HTML);
+    return {
+      status: 200,
+      bytes,
+      headers: new Headers({ "content-type": "text/html; charset=utf-8", "last-modified": PAGE_LAST_MODIFIED, etag: '"v1"' }),
+      notModified: false,
+      finalUrl: "https://www.fda.gov/safety/recalls/listeria-outbreak-2026",
+    };
+  });
+  const run2 = await runCollect(h.config, h.store, h.stub as never, "2026-10-16T02:00:00.000Z", { full: false, maxWork: 1000, progress: () => {} });
+  assert.ok(run2.perStage.at(-1)!.notice.includes("抓取 1 篇"), run2.perStage.at(-1)!.notice);
+  assert.equal(h.store.pendingDocumentCount(), 0);
+});
+
+test("reset: 只清假失败 (403/429/超体积), 真的坏文档保留", () => {
+  const dir = mkdtempSync(join(tmpdir(), "fda-search-reset-"));
+  const store = new Store(join(dir, "t.db"));
+  try {
+    const save = (url: string, error: string | null): void => {
+      store.saveDocument({
+        url, kind: "html", title: "", text: "", bytes: 0,
+        etag: null, lastModified: null, fetchedAt: "2026-10-16T00:00:00.000Z", error,
+      });
+    };
+    save("https://www.fda.gov/a", "https://www.fda.gov/a 返回 HTTP 403");
+    save("https://www.fda.gov/b", "https://www.fda.gov/b 返回 HTTP 429");
+    save("https://www.fda.gov/c", "https://www.fda.gov/c 体积 5000 字节超过上限 1000");
+    save("https://www.fda.gov/d", "https://www.fda.gov/d 返回 HTTP 404");
+    save("https://www.fda.gov/e", null);
+
+    assert.equal(store.resetDocumentFailures(), 3, "只应删掉 403 / 429 / 超体积三条");
+    assert.equal(store.documentStats().total, 2, "404 与成功记录应保留");
+    assert.ok(store.getDocumentState("https://www.fda.gov/d")?.error?.includes("404"), "坏文档的记录仍在");
+    assert.equal(store.getDocumentState("https://www.fda.gov/a"), null, "假失败应已删除");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

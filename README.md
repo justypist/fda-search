@@ -20,6 +20,11 @@
 | 通道 | 命令 | 覆盖 | 增量依据 | 建议频率 |
 | --- | --- | --- | --- | --- |
 | FDA RSS (16 个 feed) | `pnpm run collect:rss` | 新闻稿/召回/安全警报等 | 条目 `guid`/`link` 去重 + 内容指纹比对 | 15-30 分钟 |
+
+feed 列表取自官方订阅总览页
+(<https://www.fda.gov/about-fda/contact-fda/subscribe-podcasts-and-news-feeds>), 地址模板为
+`<路径前缀>/<feed-id>/rss.xml`。注意该前缀目录本身返回 404, 只有子路径可用 —— 不要把它
+替换成上面那个订阅页地址, 否则所有 feed 都会拼成 404。
 | openFDA API (8 个数据集) | `pnpm run collect:openfda` | 召回/不良事件/510(k) 等结构化数据 | 滑动窗口 + `count` 聚合定位有数据的日期 + `meta.last_updated` 短路 | 1-6 小时 |
 | sitemap `lastmod` | `pnpm run collect:sitemap` | 全站 86,699 个 URL | 索引与分页两级 `If-Modified-Since` (此处响应头稳定, 304 有效) | 1-6 小时 |
 | 正文抓取 (紧跟 sitemap) | `pnpm run collect:sitemap` | 上表 URL 的正文: HTML / PDF / xlsx / docx / pptx | `ETag` / `Last-Modified` 条件请求, `documents` 表判重 | 长期后台, 每轮限量 |
@@ -36,10 +41,24 @@ pnpm run status                   # 看"正文库: N 篇, 待抓 M 个 URL"
 pnpm run recall "surrogate endpoint"
 ```
 
-> **必须了解的成本**: `robots.txt` 的 `Crawl-delay: 30` 是串行约束, 且 `content` 通道
-> 不并行、不缩短间隔。全量 86,699 个 URL (34,595 个内容页 + 52,104 个附件) 补齐需要
-> **约 30 天连续运行**。因此 `batchSize` 默认只有 200 —— 这是长期后台任务, 每轮抓一点,
-> 若干轮之后才覆盖完。`content.enabled` 默认 `false`, 需要时显式打开。
+正文抓取也可以单独跑, 不重扫 sitemap, 只消费库里已有的 URL:
+
+```bash
+pnpm run collect -- --stage content
+pnpm run collect -- --stage content --full   # 循环跑完所有待抓 (直到限流或抓完)
+```
+
+> **速率与限流**: `content.concurrency` 只决定同时在飞的请求数, 平均速率由
+> `content.minIntervalMs` 决定 (默认并发 4 + 每 1 秒发起一个请求, 约 1 请求/秒)。
+> 实测并发 20 (约 13 请求/秒) 在 100-150 个请求后就触发 FDA 的
+> `403 excessive-requests-apology`; 触发后全部工人一起暂停, 退避从
+> `content.backoffMs` 起逐次翻倍, 连续 4 次仍被挡就中止本轮。被限流挡下的 URL
+> **不落库**, 保持待抓状态, 下一轮自动重试。
+
+> **必须了解的成本**: 8.6 万个 URL 中 34,595 个内容页 + 52,104 个附件。按
+> 1 请求/秒计算约 24 小时; 若回到严格串行 (`concurrency: 1` + `minIntervalMs: 30000`
+> 以守 `Crawl-delay: 30`), 则需要约 30 天连续运行。因此 `batchSize` 默认只有 200 ——
+> 这是长期后台任务, 每轮抓一点, 若干轮之后才覆盖完。
 
 抓取顺序按 **`lastmod` 倒序**, 已抓过的 (无论成败) 不再返回, 因此批次单调前进, 中断后
 重跑会从断点继续, 不会反复卡在同一批坏 URL 上。
@@ -55,14 +74,61 @@ pnpm run recall "surrogate endpoint"
 | --- | --- | --- |
 | `enabled` | `false` | 是否启用正文抓取 |
 | `batchSize` | `200` | 每轮最多抓多少篇 |
+| `concurrency` | `1` | 并发工人数 (同时在飞的请求数) |
+| `minIntervalMs` | `500` | 相邻请求起点的最小间隔, 决定平均速率 |
+| `backoffMs` | `60000` | 被限流后的首次退避, 之后逐次翻倍, 上限 30 分钟 |
 | `include` / `exclude` | 内容页目录 + `/media/` | URL 子串过滤, 直接下推到 SQL |
 | `pdf` / `office` | `true` | 是否解析 PDF / Office 文档 |
+| `ocr` | `true` | 是否对扫描页做 OCR |
+| `ocrEngine` | `local` | `local` (PP-OCRv6, 本地) / `vision` (视觉模型) / `off` |
+| `ocrMaxPages` | `8` | 单个 PDF 最多 OCR 多少页 |
+| `ocrConcurrency` | `1` | 视觉模型的并发请求数上限 (仅 `vision` 引擎) |
 | `maxBytes` | `64 MiB` | 单个文件上限, 超过则跳过并记为失败 |
 | `match` | `false` | 正文是否参与关键词告警 (见下) |
 
 **关于 `match`**: 默认关闭。打开后正文也会走关键词规则, 但补齐历史存量时会让大量旧页面
 一次性命中 —— 监听的语义是"新出现的", 不是"库里已有的"。建议只在存量补齐完成、进入
 稳定增量后再打开。
+
+**扫描件 OCR**: PDF 用 `@firecrawl/pdf-inspector` 解析, 它会把文档分类成
+`TextBased` / `Scanned` / `Mixed` / `ImageBased`, 并把原生文本转成 markdown (带标题层级与
+表格)。被判为需要 OCR 的页面再转写, 有两个引擎:
+
+| 引擎 | 依赖 | 实测速度 | 质量 |
+| --- | --- | --- | --- |
+| `local` (默认) | PDFium + ONNX Runtime | 2 页 2.8 秒 / 8 页 9.7 秒 | 足够; 版式固定的扫描件字段全部正确 |
+| `vision` | `.env` 的 `LLM_*` | 单页 20-90 秒 | 更高, 会补全表格结构 |
+| `off` | 无 | — | 扫描页留空 |
+
+本地引擎快一到两个数量级, 且**不产生 API 费用** (纯 CPU), 因此默认用它:
+
+```bash
+pnpm run ocr:setup     # 下载 PDFium 与 ONNX Runtime 到 vendor/ocr (~30 MB)
+```
+
+模型 (~30 MB) 由库在首次 OCR 时自动下载到 `~/.cache/pdf-inspector`, 之后离线可用。
+未安装运行时时扫描件会被记为"待 OCR" (`status` 显示数量) 而不是空正文, 装好后下一轮
+自动重跑。
+
+需要更高质量时切到视觉引擎:
+
+```bash
+cp .env.example .env
+# 填 LLM_BASE_URL (OpenAI 兼容网关)、LLM_API_KEY、LLM_MODEL
+```
+
+然后把 `content.ocrEngine` 改成 `vision`。视觉引擎的实测特性:
+单个 PDF 最多 OCR `content.ocrMaxPages` 页 (默认 8); `ocrConcurrency` 默认 1 (串行),
+因为并发 2-4 时网关会明显变慢, 单页从 20-30 秒拉长到 60 秒以上, 总吞吐反而下降。
+单页有 150 秒硬超时 + 一次重试, 超时用独立的 AbortController 计时器 ——
+SDK 自带的 `timeout` 在流式响应上不总能生效, 实测出现过连接挂着不吐数据也不报错、
+把整个抓取进程卡死的情况。
+
+> **网关注意**: 视觉请求走**流式**接口。实测网关前置 CDN (EdgeOne) 对"响应头迟迟不来"
+> 有约 10 秒的超时限制, 而非流式请求要等整页转写完成才返回响应头 (约 15-30 秒),
+> 会稳定收到 `554 Response Timeout`。流式请求由模型立刻开始吐 token, 可长时间持续。
+> 另外部分 One-API / New-API 系网关会把响应再包一层 `{"data": {...}}`,
+> 客户端已在 fetch 层自动解包。
 
 ### openFDA 批量通道 (补历史)
 
@@ -98,6 +164,8 @@ pnpm run bulk --limit 20                       # 一次多下几个分区
    代理池 + 高频并行的流量特征与爬虫滥用同类, 可能连带把正常通道 (RSS / sitemap) 一起降级
 3. 收益不划算: 唯一的效果是把"补陈年归档"从 30 天压到几天, 而真正在变的内容
    (每天约 26 个) 本来就只需 13 分钟/天
+4. **实测硬上限**: 并发 20 (约 13 请求/秒) 在 100-150 个请求后就会收到
+   `403 excessive-requests-apology`, 实际可用的速率远低于并行带来的理论收益
 
 要提速请用上面三个正当手段: **`lastmod` 倒序** + **openFDA 批量通道** + 需要更高频率时
 **填上真实联系方式正式联系 FDA 申请**。
@@ -135,7 +203,10 @@ pnpm run typecheck            # 类型检查
 ```
 
 要求 Node >= 24 (使用原生 TypeScript 类型剥离与 `node:sqlite`, 无构建步骤, 无第三方运行时框架)。
-正文通道额外依赖 `pdfjs-dist` (PDF) 与 `fflate` (Office 文档解压)。
+正文通道额外依赖 `@firecrawl/pdf-inspector` (PDF 分类、markdown 抽取与本地 OCR)、
+`pdfjs-dist` 与 `@napi-rs/canvas` (仅 `vision` 引擎用来从扫描页取像素)、
+`fflate` (Office 文档解压)。本地 OCR 另需 `pnpm run ocr:setup` 安装运行时库,
+视觉引擎则需 `.env` 配置, 见下文"正文通道"。
 
 ### 本地搜索界面
 
@@ -165,7 +236,7 @@ open 'http://127.0.0.1:8787/?q=listeria'
 {
   "dataDir": "./data",
   "notify": ["jsonl"],          // 通知通道, 目前仅内置 jsonl
-  "stages": [],                 // 留空表示全部通道, 也可填 ["rss"]
+  "stages": [],                 // 留空表示全部阶段, 也可填 ["rss"] / ["content"]
   "maxWork": 2000,              // 单轮最多处理的队列条数
   "keywords": [
     {
@@ -186,6 +257,9 @@ open 'http://127.0.0.1:8787/?q=listeria'
   "content": {
     "enabled": false,        // 打开后每轮抓一批正文 (见"正文通道")
     "batchSize": 200,        // 每轮最多抓多少篇
+    "concurrency": 1,        // 并发工人数 (同时在飞的请求数)
+    "minIntervalMs": 500,    // 相邻请求起点的最小间隔, 决定平均速率
+    "backoffMs": 60000,      // 被限流的首次退避, 之后逐次翻倍 (上限 30 分钟)
     "include": ["/safety/", "/media/"],
     "exclude": [],
     "pdf": true,             // 解析 PDF
@@ -212,10 +286,11 @@ open 'http://127.0.0.1:8787/?q=listeria'
 ```bash
 node src/cli.ts <命令> [选项]
 
-命令: collect | bulk | serve | status | alerts [n] | search <关键词> | recall <关键词> | tail [n]
+命令: collect | bulk | serve | status | alerts [n] | search <关键词> | recall <关键词> | reset | tail [n]
 
 -c, --config <路径>   配置文件 (默认 ./monitor.config.json)
-    --stage <名称>    仅跑指定通道, 可重复: rss | openfda | sitemap (正文随 sitemap)
+    --stage <名称>    仅跑指定阶段, 可重复: rss | openfda | sitemap | content
+                      (默认 content 随 sitemap; 显式指定 content 时只抓正文, 不重扫 sitemap)
     --full            忽略条件请求缓存, 强制全量重拉; 同时解除正文的 batchSize 限制
     --max-work <n>    本轮最多处理的队列条数 (默认取配置)
     --dataset <名称>  bulk 限定数据集, 可重复 (默认取配置)
@@ -235,7 +310,7 @@ node src/cli.ts <命令> [选项]
 ## 测试
 
 ```bash
-pnpm test        # 40 项, node:test, 不联网
+pnpm test        # 52 项, node:test, 不联网
 ```
 
 - `test/units.test.ts` — 日期解析 (RFC-822 时区/紧凑与带连字符日期)、关键词规则
@@ -292,9 +367,13 @@ sitemap 落库的 URL  →  正文抓取 (sources/content)  →  documents 表 (
 
 ## 合规与限速 (重要)
 
-- 对 `fda.gov` 的请求按 `robots.txt` 的 `Crawl-delay: 30` **串行限速 30 秒**,
-  这是本工具单轮耗时的主要来源: RSS 16 个 feed 约 8 分钟, sitemap 首轮 44 页约 22 分钟。
+- 对 `fda.gov` 的 RSS / sitemap 请求按 `robots.txt` 的 `Crawl-delay: 30` **串行限速 30 秒**,
+  这是这两个通道单轮耗时的主要来源: RSS 16 个 feed 约 8 分钟, sitemap 首轮 44 页约 22 分钟。
   **请勿调小 `http.fdaDelayMs`。** 首轮之后 sitemap 依靠 `If-Modified-Since` 通常只需拉 0-3 页。
+- 正文通道用独立闸门 (`content.concurrency` + `content.minIntervalMs`), 不共用上面这个
+  串行间隔。**实测速率边界**: 并发 20 (约 13 请求/秒) 会在 100-150 个请求后收到
+  `403 excessive-requests-apology`; 默认配置 (并发 4, 每 1 秒一个请求) 远低于该阈值。
+  提高速率前请自行评估, 触发限流时工具会自动退避并中止本轮。
 - openFDA 走 `api.fda.gov`, 不受 crawl-delay 约束, 免 key 配额为 240 请求/分钟、1000 请求/天。
   openFDA 的日期范围**必须用 `YYYYMMDD` 或 `YYYY-MM-DD` 字面量**, 空格两边不能写成 `+`
   (实测 `[20260901+TO+20261016]` 会返回 HTTP 500)。
@@ -315,8 +394,20 @@ sitemap 落库的 URL  →  正文抓取 (sources/content)  →  documents 表 (
 - **sitemap 有生成延迟**: 实测新页面发布约 7 小时后仍不在 sitemap 里 (sitemap 索引
   `lastmod` 是生成时刻, 页面 `datePublished` 晚于它)。因此"页面存在但 sitemap 里没有"
   属正常现象, 不代表漏收。想要零延迟只能另建推送通道。
-- **正文抓取的换算成本**: `Crawl-delay: 30` 下抓 86,699 个 URL 需约 30 天连续运行
-  (34,595 个内容页约 12 天, 52,104 个附件约 18 天)。这是串行约束的下限, 不要试图并行绕过。
+- **正文抓取的换算成本**: 86,699 个 URL (34,595 个内容页 + 52,104 个附件)。
+  按默认速率 (约 1 请求/秒) 约 24 小时; 若回退到严格串行守 `Crawl-delay: 30`,
+  则需约 30 天。实测并发 20 会触发限流, 不存在"并行几分钟抓完"的选项。
+- **纯图像 PDF 走 OCR**: 约 26% 的 FDA PDF (实测 79/302) 是整页扫描件,
+  没有文字层。PDF 解析用 [`@firecrawl/pdf-inspector`](https://github.com/firecrawl/pdf-inspector)
+  (Rust), 它先分类 (TextBased / Scanned / Mixed / ImageBased) 并把原生文本转成
+  markdown; 被判为需要 OCR 的页面再由 `content.ocrEngine` 指定的引擎转写。
+  默认的本地 PP-OCRv6 实测比视觉模型快 10-40 倍且无 API 费用, 质量对扫描件足够。
+- **OCR 不可用时扫描件不会丢**: 完全提取不到正文的扫描件会记成一条
+  `OCR 未配置` 的待办行 (不重复抓取, `status` 里显示为"待 OCR N 篇"); 运行时或
+  视觉模型配好后, 下一轮抓取会自动把它们放回队列并完成 OCR。Mixed 型 PDF 若已有
+  可提取文本, 照常落库, 不因缺 OCR 而丢弃那部分正文。
+- **假失败可以回滚**: 被限流挡下或超过 `content.maxBytes` 的 URL 会以错误行落库,
+  默认不再重试。`pnpm run reset` 会清掉 403/429/超体积这三类记录, 让它们重新待抓。
 - 抓取时遇到过 **301 重定向** 的 sitemap URL (旧地址跳到新地址, 但旧地址仍在 sitemap 里)。
   代码会把重定向目标也记进 `documents` 以免重复抓, 但**两个 URL 会各留一条 sitemap 条目**,
   检索时同一内容可能出现两次。

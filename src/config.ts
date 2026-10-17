@@ -15,11 +15,18 @@ const HTTP_DEFAULTS: HttpConfig = {
 const CONTENT_DEFAULTS: ContentConfig = {
   enabled: false,
   batchSize: 200,
+  concurrency: 1,
+  minIntervalMs: 500,
+  backoffMs: 60_000,
   include: [...SITEMAP_DEFAULT_INCLUDE, "/media/"],
   exclude: [],
   pdf: true,
   office: true,
   maxBytes: 64 * 1024 * 1024,
+  ocr: true,
+  ocrEngine: "local",
+  ocrMaxPages: 8,
+  ocrConcurrency: 1,
   match: false,
 };
 
@@ -143,11 +150,30 @@ export const loadConfig = (cwd: string, configPath: string): Config => {
   const content: ContentConfig = {
     enabled: typeof contentObj.enabled === "boolean" ? contentObj.enabled : CONTENT_DEFAULTS.enabled,
     batchSize: typeof contentObj.batchSize === "number" ? contentObj.batchSize : CONTENT_DEFAULTS.batchSize,
+    concurrency: typeof contentObj.concurrency === "number" && contentObj.concurrency >= 1
+      ? Math.floor(contentObj.concurrency)
+      : CONTENT_DEFAULTS.concurrency,
+    minIntervalMs: typeof contentObj.minIntervalMs === "number" && contentObj.minIntervalMs >= 0
+      ? Math.floor(contentObj.minIntervalMs)
+      : CONTENT_DEFAULTS.minIntervalMs,
+    backoffMs: typeof contentObj.backoffMs === "number" && contentObj.backoffMs >= 0
+      ? Math.floor(contentObj.backoffMs)
+      : CONTENT_DEFAULTS.backoffMs,
     include: asArray(contentObj.include)?.filter((v): v is string => typeof v === "string") ?? [...CONTENT_DEFAULTS.include],
     exclude: asArray(contentObj.exclude)?.filter((v): v is string => typeof v === "string") ?? [...CONTENT_DEFAULTS.exclude],
     pdf: typeof contentObj.pdf === "boolean" ? contentObj.pdf : CONTENT_DEFAULTS.pdf,
     office: typeof contentObj.office === "boolean" ? contentObj.office : CONTENT_DEFAULTS.office,
     maxBytes: typeof contentObj.maxBytes === "number" ? contentObj.maxBytes : CONTENT_DEFAULTS.maxBytes,
+    ocr: typeof contentObj.ocr === "boolean" ? contentObj.ocr : CONTENT_DEFAULTS.ocr,
+    ocrEngine: contentObj.ocrEngine === "vision" || contentObj.ocrEngine === "off" || contentObj.ocrEngine === "local"
+      ? contentObj.ocrEngine
+      : CONTENT_DEFAULTS.ocrEngine,
+    ocrMaxPages: typeof contentObj.ocrMaxPages === "number" && contentObj.ocrMaxPages >= 1
+      ? Math.floor(contentObj.ocrMaxPages)
+      : CONTENT_DEFAULTS.ocrMaxPages,
+    ocrConcurrency: typeof contentObj.ocrConcurrency === "number" && contentObj.ocrConcurrency >= 1
+      ? Math.floor(contentObj.ocrConcurrency)
+      : CONTENT_DEFAULTS.ocrConcurrency,
     match: typeof contentObj.match === "boolean" ? contentObj.match : CONTENT_DEFAULTS.match,
   };
 
@@ -172,11 +198,11 @@ export const loadConfig = (cwd: string, configPath: string): Config => {
     bulk,
     keywords,
     notify: asArray(raw.notify)?.filter((v): v is string => typeof v === "string") ?? ["jsonl"],
-    stages: (asArray(raw.stages)?.filter((v): v is string => typeof v === "string") ?? []).filter(isSourceKind),
+    stages: (asArray(raw.stages)?.filter((v): v is string => typeof v === "string") ?? []).filter(isStageName),
     maxWork: typeof raw.maxWork === "number" ? raw.maxWork : 2_000,
     http: mergeHttp(raw.http),
   };
 };
 
-const isSourceKind = (value: string): value is Config["stages"][number] =>
-  value === "rss" || value === "openfda" || value === "sitemap";
+const isStageName = (value: string): value is Config["stages"][number] =>
+  value === "rss" || value === "openfda" || value === "sitemap" || value === "content";

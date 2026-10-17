@@ -49,24 +49,20 @@
     "exclude": []
   },
   "content": {
-    "enabled": false,
-    "batchSize": 200,
-    "include": [
-      "/safety/",
-      "/news-events/",
-      "/drugs/",
-      "/medical-devices/",
-      "/food/",
-      "/biologics/",
-      "/vaccines-blood-biologics/",
-      "/inspections-compliance-enforcement-and-criminal-investigations/",
-      "/tobacco-products/",
-      "/media/"
-    ],
+    "enabled": true,
+    "batchSize": 500,
+    "concurrency": 4,
+    "minIntervalMs": 1000,
+    "backoffMs": 60000,
+    "include": [],
     "exclude": [],
     "pdf": true,
     "office": true,
     "maxBytes": 67108864,
+    "ocr": true,
+    "ocrEngine": "local",
+    "ocrMaxPages": 8,
+    "ocrConcurrency": 1,
     "match": false
   },
   "bulk": {

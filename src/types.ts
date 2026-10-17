@@ -1,5 +1,9 @@
 export type SourceKind = "rss" | "openfda" | "sitemap";
 
+// 流水线阶段。content 不是采集通道 (它消费 sitemap 已落库的 URL),
+// 但同样需要能单独跑, 因此与三个采集通道并列。
+export type StageName = SourceKind | "content";
+
 export interface Item {
   id: string;
   source: SourceKind;
@@ -61,11 +65,34 @@ export interface ContentConfig {
   // 长期后台追赶任务: 34,595 个内容页 + 52,104 个附件在 30 秒 crawl-delay
   // 下需要数十天, 只能慢慢补, 不能阻塞主流程。
   batchSize: number;
+  // 并发工人数。只决定"同时在飞"的请求数, 不决定速率 —— 速率由
+  // minIntervalMs 控制。1 = 严格串行。
+  // 注意: 实测并发 20 (约 13 请求/秒) 在 100-150 个请求后就触发 FDA 的
+  // 403 excessive-requests-apology, 因此高并发不可用; 当前默认取保守值。
+  concurrency: number;
+  // 全局请求起点的最小间隔 (毫秒)。并发数决定"同时在飞"的请求数,
+  // 这个值决定平均速率; 两者共同决定对 FDA 的压力。
+  minIntervalMs: number;
+  // 被限流 (403/429) 后的首次退避时长 (毫秒), 之后逐次翻倍, 上限 30 分钟。
+  // 连续 4 次仍被限流就中止本轮, 未抓的 URL 保持待抓。
+  backoffMs: number;
   include: string[];
   exclude: string[];
   pdf: boolean;
   office: boolean;
   maxBytes: number;
+  // 扫描页的 OCR 引擎:
+  //   local  — pdf-inspector 内置 PP-OCRv6 (ONNX, 纯本地 CPU), 实测 2 页约 2.8 秒;
+  //   vision — 视觉模型 (.env 的 LLM_*), 单页 20-90 秒且按 token 计费;
+  //   off    — 不做 OCR。
+  ocr: boolean;
+  ocrEngine: "local" | "vision" | "off";
+  // 单个 PDF 最多 OCR 多少页。扫描件动辄几十页, 全量 OCR 成本高;
+  // 只取前 N 页已足够让文档可被检索。
+  ocrMaxPages: number;
+  // 同时在跑的视觉请求数上限。单页转写约 20-30 秒, 这个值决定 OCR 的吞吐,
+  // 与抓取并发 (content.concurrency) 无关。
+  ocrConcurrency: number;
   // 正文入队后是否参与关键词匹配。默认关闭, 避免补历史时一次性爆出大量告警。
   match: boolean;
 }
@@ -91,7 +118,7 @@ export interface Config {
   bulk: BulkConfig;
   keywords: KeywordRule[];
   notify: string[];
-  stages: SourceKind[];
+  stages: StageName[];
   maxWork: number;
   http: HttpConfig;
 }

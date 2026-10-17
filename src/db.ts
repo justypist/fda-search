@@ -696,6 +696,28 @@ export class Store {
     return { total: num(row?.total), ok: num(row?.ok), failed: num(row?.failed), chars: num(row?.chars), byKind };
   }
 
+  // 清掉"假失败": 被限流 (403/429) 或超过体积上限的记录其实没抓到内容,
+  // 但失败也落库的设计让它们永远不再排队。删除后它们重新成为待抓项。
+  // 真正的坏文档 (404、解析失败) 与"待 OCR"标记都不在此列 —— 后者由
+  // resetOcrSkipped 在视觉模型可用时自动处理, 否则会陷入重抓又重标的循环。
+  // 必须匹配错误消息的尾部而不是全文: 错误消息以 URL 开头, URL 里也可能含 "403"。
+  resetDocumentFailures(): number {
+    const result = this.#stmt(
+      "DELETE FROM documents WHERE error LIKE '% 返回 HTTP 403' OR error LIKE '% 返回 HTTP 429' OR error LIKE '% 字节超过上限 %'",
+    ).run();
+    return Number(result.changes);
+  }
+
+  // 配置好视觉模型后, 之前被跳过的扫描件自动回到待抓队列。
+  resetOcrSkipped(): number {
+    const result = this.#stmt("DELETE FROM documents WHERE error LIKE 'OCR 未配置%'").run();
+    return Number(result.changes);
+  }
+
+  ocrPendingCount(): number {
+    return this.#count("SELECT COUNT(*) AS total FROM documents WHERE error LIKE 'OCR 未配置%'");
+  }
+
   // FTS5 的 MATCH 语法对用户输入不友好 (裸写 - . : 会被当运算符), 这里把查询拆成
   // 词元并逐个加引号, 使其总被当作短语字面量。
   #ftsQuery(query: string): string {

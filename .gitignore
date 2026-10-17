@@ -2,3 +2,6 @@ node_modules/
 data/
 *.log
 .playwright-mcp/
+.env
+# OCR 运行时共享库 (30 MB 二进制), 用 pnpm run ocr:setup 获取
+vendor/ocr/

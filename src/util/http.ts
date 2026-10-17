@@ -39,14 +39,28 @@ export interface StreamResponse {
 export class HttpError extends Error {
   readonly status: number;
   readonly scope: string;
+  // 仅 403/429 时保留响应体开头: FDA 的限流页会指向 excessive-requests-apology,
+  // 调用方据此区分"被限流"与"该 URL 本来就不允许访问"。
+  readonly body: string;
+  // Retry-After 换算成毫秒; 服务器没给则为 0, 由调用方决定退避策略。
+  readonly retryAfterMs: number;
 
-  constructor(message: string, status: number, scope: string) {
+  constructor(message: string, status: number, scope: string, body: string = "", retryAfterMs: number = 0) {
     super(message);
     this.name = "HttpError";
     this.status = status;
     this.scope = scope;
+    this.body = body;
+    this.retryAfterMs = retryAfterMs;
   }
 }
+
+const retryAfterMsOf = (headers: Headers): number => {
+  const seconds = Number(headers.get("retry-after"));
+  if (Number.isFinite(seconds) && seconds > 0) return seconds * 1000;
+  const at = Date.parse(headers.get("retry-after") ?? "");
+  return Number.isNaN(at) ? 0 : Math.max(0, at - Date.now());
+};
 
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
 
@@ -228,5 +242,56 @@ export class HttpClient {
       throw new HttpError(`${request.url} 返回 HTTP ${response.status}`, response.status, scope);
     }
     return { status: response.status, body: response.body, headers: response.headers };
+  }
+
+  // 无节流的字节抓取, 供并发工人使用。
+  //
+  // 存在的理由: #throttle 是按 scope 串行的 —— 并发调用 fetchBytes 只会被它排成一队,
+  // 拿不到任何并行度。并发由调用方统一控制 (固定的 N 个工人), 因此这里不再节流,
+  // 也不重试 (重试会放大并发数, 让实际速率不可控)。
+  //
+  // 注意: 这会突破 robots.txt 的 Crawl-Delay 声明, 仅在调用方明确选择并发时使用。
+  async fetchBytesDirect(request: HttpRequest & { maxBytes?: number; timeoutMs?: number }): Promise<BinaryResponse> {
+    const limit = request.maxBytes ?? this.#config.maxBytes;
+    const headers: Record<string, string> = {
+      "user-agent": this.#config.userAgent,
+      accept: "*/*",
+      "accept-language": "en-US,en;q=0.9",
+      ...request.headers,
+    };
+    if (request.conditional?.lastModified) headers["if-modified-since"] = request.conditional.lastModified;
+
+    const response = await fetch(request.url, {
+      headers,
+      redirect: "follow",
+      signal: AbortSignal.timeout(request.timeoutMs ?? this.#config.timeoutMs),
+    });
+    if (response.status === 304) {
+      return { status: 304, bytes: new Uint8Array(0), headers: response.headers, notModified: true, finalUrl: response.url };
+    }
+    if (!response.ok) {
+      if (response.status === 403 || response.status === 429) {
+        const body = await response.text().catch(() => "");
+        throw new HttpError(
+          `${request.url} 返回 HTTP ${response.status}`,
+          response.status,
+          "fda.gov",
+          body.slice(0, 512),
+          retryAfterMsOf(response.headers),
+        );
+      }
+      await response.body?.cancel();
+      throw new HttpError(`${request.url} 返回 HTTP ${response.status}`, response.status, "fda.gov");
+    }
+    const declared = Number(response.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > limit) {
+      await response.body?.cancel();
+      throw new HttpError(`${request.url} 体积 ${declared} 字节超过上限 ${limit}`, 0, "size");
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > limit) {
+      throw new HttpError(`${request.url} 体积 ${bytes.byteLength} 字节超过上限 ${limit}`, 0, "size");
+    }
+    return { status: response.status, bytes, headers: response.headers, notModified: false, finalUrl: response.url || request.url };
   }
 }

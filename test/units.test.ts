@@ -9,6 +9,7 @@ import { parseRfc822, parseIsoDate, toCompactDate, toDashedDate } from "../src/u
 import { matchAll } from "../src/util/keyword.ts";
 import { fieldText, pick, stripTags, sha1, truncate } from "../src/util/text.ts";
 import { batchKeyOf } from "../src/pipeline.ts";
+import { strayFlags, stripSeparators } from "../src/util/args.ts";
 import { parseOpenFdaCursor, formatOpenFdaCursor } from "../src/sources/openfda.ts";
 import { matchesFilter, toSitemapItem } from "../src/sources/sitemap.ts";
 import { decodeEntities, extractHtml, kindFromContentType, normalizeText, officeKindOf, xmlPartsToText } from "../src/content/extract.ts";
@@ -400,4 +401,12 @@ test("批量下载: 流式解析 openFDA 分区 (避免爆栈与内存上限)", 
     const target: number[] = [];
     (target.push as (...n: number[]) => number)(...big);
   }, /call stack|too many arguments/i, "展开 15 万个实参应溢出");
+});
+
+test("回归: pnpm 传入的 `--` 不能被当成位置参数, 否则开关全部丢失而跑起全部通道", () => {
+  const cleaned = stripSeparators(["collect", "--", "--stage", "content", "--full", "--verbose"]);
+  assert.deepEqual(cleaned, ["collect", "--stage", "content", "--full", "--verbose"], "分隔符应被剔除");
+  assert.deepEqual(stripSeparators(["collect", "--stage", "content"]), ["collect", "--stage", "content"], "无分隔符时不变");
+  assert.deepEqual(strayFlags(["--stage", "content"]), ["--stage"], "漏网的开关必须能被识别");
+  assert.deepEqual(strayFlags(["collect"]), [], "正常位置参数不应误报");
 });

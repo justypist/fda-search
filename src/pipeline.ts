@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Config, Item, SourceKind } from "./types.ts";
+import type { Config, Item, SourceKind, StageName } from "./types.ts";
 import type { Store } from "./db.ts";
 import type { HttpClient } from "./util/http.ts";
 import { matchAll, type Match } from "./util/keyword.ts";
@@ -9,13 +9,14 @@ import { dispatch } from "./notify/index.ts";
 import { fetchFeed } from "./sources/rss.ts";
 import { fetchDataset, openFdaChannel } from "./sources/openfda.ts";
 import { fetchIndex, fetchPage, matchesFilter, toSitemapItem } from "./sources/sitemap.ts";
-import { collectContent } from "./sources/content.ts";
+import { collectContent, RequestGate, type ContentStat } from "./sources/content.ts";
+import { createVisionFromEnv } from "./content/vision.ts";
 
 export const SITEMAP_CHANNEL = "sitemap:fda.gov";
 const INDEX_STATE_CHANNEL = "sitemap:index";
 
 export interface StageStat {
-  stage: SourceKind;
+  stage: StageName;
   produced: number;
   notice: string;
 }
@@ -340,20 +341,66 @@ export const runCollect = async (
     perStage.push(await collectSitemap(config, store, client, runId, startedAt, options.progress, options.full));
     await settleStage();
   }
-  // 正文抓取排在最后: 它消费的是 sitemap 刚落库的 URL。默认关闭 (content.enabled),
-  // 因为全量补齐受 Crawl-delay: 30 约束需要数十天, 应当由使用者显式选择何时开始。
-  if (config.content.enabled) {
-    const stat = await collectContent(config.content, store, client, startedAt, options.progress, {
-      batchSize: options.full ? Number.MAX_SAFE_INTEGER : config.content.batchSize,
-      httpMaxBytes: config.http.maxBytes,
-    });
-    const kinds = Object.entries(stat.kinds).map(([kind, n]) => `${kind} ${n}`).join(" / ");
+  // 正文抓取消费的是 sitemap 刚落库的 URL, 因此排在 sitemap 之后。
+  // 它也可以单独跑 (--stage content), 此时不会重扫 sitemap, 只消费库里的存量;
+  // 显式指定该阶段时忽略 content.enabled, 否则使用者无从临时开跑。
+  const wantContent = config.stages.length === 0 ? config.content.enabled : config.stages.includes("content");
+  if (wantContent) {
+    // --full 表示"这一轮尽量抓完", 但仍然分批循环而不是一次取 8.6 万个:
+    // 每批抓完就落库, 进程中断只损失当前批, 重启能接着上次的位置继续。
+    const batchSize = Math.min(config.content.batchSize, 5000);
+    const maxBatches = options.full ? Math.ceil(86_700 / batchSize) : 1;
+    // 闸门跨批次共享: 被限流后退避的历史必须延续到下一批, 否则批量循环会立刻重置退避。
+    const gate = new RequestGate({ minIntervalMs: config.content.minIntervalMs, baseBackoffMs: config.content.backoffMs });
+    const total: ContentStat = {
+      fetched: 0, skipped: 0, failed: 0, deferred: 0, ocr: 0, ocrPending: 0, ocrFailed: 0, chars: 0, remaining: 0, kinds: {}, aborted: false,
+    };
+    let batches = 0;
+    // OCR 引擎为本地 PP-OCR 时不需要视觉模型, 也就不必去读 .env。
+    const vision = config.content.ocrEngine === "vision"
+      ? createVisionFromEnv(process.env, config.content.ocrConcurrency)
+      : null;
+    const engine = !config.content.ocr ? "off" : config.content.ocrEngine;
+    options.progress(
+      engine === "local"
+        ? "  · OCR 引擎: 本地 PP-OCRv6 (无需 API)"
+        : engine === "vision"
+          ? vision === null
+            ? "  · 未配置视觉模型 (LLM_BASE_URL / LLM_API_KEY / LLM_MODEL): 扫描件 PDF 会被标记待 OCR 并跳过"
+            : `  · OCR 引擎: 视觉模型 ${vision.model}`
+          : "  · OCR 已关闭: 扫描件 PDF 会被标记待 OCR 并跳过",
+    );
+    for (let i = 0; i < maxBatches; i += 1) {
+      const stat = await collectContent(config.content, store, client, startedAt, options.progress, {
+        batchSize,
+        gate,
+        vision,
+      });
+      total.fetched += stat.fetched;
+      total.skipped += stat.skipped;
+      total.failed += stat.failed;
+      total.deferred += stat.deferred;
+      total.ocr += stat.ocr;
+      total.ocrPending += stat.ocrPending;
+      total.ocrFailed += stat.ocrFailed;
+      total.chars += stat.chars;
+      total.remaining = stat.remaining;
+      for (const [kind, n] of Object.entries(stat.kinds)) total.kinds[kind] = (total.kinds[kind] ?? 0) + n;
+      batches += 1;
+      if (stat.aborted || stat.remaining === 0) break;
+      if (stat.fetched + stat.skipped + stat.failed + stat.deferred + stat.ocrPending === 0) break;
+      options.progress(
+        `  … 正文累计 ${total.fetched} 篇 / 跳过 ${total.skipped} / 失败 ${total.failed} / 限流推迟 ${total.deferred} / OCR ${total.ocr} 页, 待抓 ${stat.remaining} (第 ${batches} 批)`,
+      );
+    }
+    const kinds = Object.entries(total.kinds).map(([kind, n]) => `${kind} ${n}`).join(" / ");
     perStage.push({
-      stage: "sitemap",
+      stage: "content",
       produced: 0,
       notice:
-        `正文 抓取 ${stat.fetched} 篇 / 跳过 ${stat.skipped} / 失败 ${stat.failed}, ` +
-        `新增 ${stat.chars} 字符${kinds.length > 0 ? ` (${kinds})` : ""}, 待抓 ${stat.remaining}`,
+        `正文 ${batches} 批${total.aborted ? " (触发限流, 本轮中止)" : ""}: 抓取 ${total.fetched} 篇 / 跳过 ${total.skipped} / ` +
+        `失败 ${total.failed} / 限流推迟 ${total.deferred} / OCR ${total.ocr} 页 / OCR 失败 ${total.ocrFailed} 页 / 待 OCR ${total.ocrPending} 篇, ` +
+        `新增 ${total.chars} 字符${kinds.length > 0 ? ` (${kinds})` : ""}, 待抓 ${total.remaining}`,
     });
   }
 

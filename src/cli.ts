@@ -1,16 +1,18 @@
 import { parseArgs } from "node:util";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { loadConfig } from "./config.ts";
 import { Store } from "./db.ts";
 import { HttpClient } from "./util/http.ts";
 import { acquireLock } from "./util/lock.ts";
+import { strayFlags, stripSeparators } from "./util/args.ts";
 import { runCollect } from "./pipeline.ts";
 import { fetchBulk } from "./sources/bulk.ts";
 import { serve } from "./server.ts";
 import { matchAll } from "./util/keyword.ts";
 import { notifierNames } from "./notify/index.ts";  // 该模块内部已引入全部内置通道
 import type { Alert } from "./pipeline.ts";
-import type { Item, SourceKind } from "./types.ts";
+import type { Item, StageName } from "./types.ts";
 
 const USAGE = `FDA 变更监听
 
@@ -24,11 +26,12 @@ const USAGE = `FDA 变更监听
   alerts               列出历史告警
   search <关键词>      在已落库条目中检索
   recall <关键词>      在正文库中全文检索 (FTS5)
+  reset                清除正文库里的假失败 (403/429/超体积), 让它们重新待抓
   tail [n]             显示最新 n 条已落库条目 (默认 20)
 
 选项:
   -c, --config <路径>  配置文件 (默认 ./monitor.config.json)
-      --stage <名称>   仅跑指定通道, 可重复: rss | openfda | sitemap
+      --stage <名称>   仅跑指定阶段, 可重复: rss | openfda | sitemap | content
       --full           忽略条件请求缓存, 强制全量拉取 (sitemap / 正文)
       --max-work <n>   本轮最多处理的队列条数 (默认取配置)
       --dataset <名称> bulk 限定数据集, 可重复 (默认取配置)
@@ -44,7 +47,7 @@ interface CliOptions {
   command: string;
   positional: string[];
   config: string;
-  stages: SourceKind[];
+  stages: StageName[];
   full: boolean;
   maxWork: number | null;
   datasets: string[];
@@ -54,11 +57,11 @@ interface CliOptions {
   json: boolean;
 }
 
-const STAGES = ["rss", "openfda", "sitemap"] as const;
+const STAGES = ["rss", "openfda", "sitemap", "content"] as const;
 
 const parse = (argv: string[]): CliOptions => {
   const { values, positionals } = parseArgs({
-    args: argv,
+    args: stripSeparators(argv),
     allowPositionals: true,
     options: {
       config: { type: "string", short: "c", default: "./monitor.config.json" },
@@ -92,11 +95,21 @@ const parse = (argv: string[]): CliOptions => {
   if (invalid.length > 0) {
     throw new Error(`未知通道 ${invalid.join(", ")}, 可选值: ${STAGES.join(" | ")}`);
   }
+  const positional = positionals.slice(1);
+  const command = positionals[0] ?? "help";
+  // 未被识别的开关若落进位置参数, 说明调用写法有问题。collect / bulk 一旦静默忽略
+  // 这些开关就会跑起全部通道, 因此直接报错而不是继续。search / recall 的关键词
+  // 可能含 `-`, 不在此列。
+  const freeform = command === "search" || command === "recall";
+  const stray = freeform ? [] : strayFlags(positional);
+  if (stray.length > 0) {
+    throw new Error(`无法识别的选项 ${stray.join(", ")}, 请检查写法 (pnpm run 需写成 pnpm run collect -- --stage content)`);
+  }
   return {
-    command: positionals[0] ?? "help",
-    positional: positionals.slice(1),
+    command,
+    positional,
     config: values.config ?? "./monitor.config.json",
-    stages: rawStages.filter((s): s is SourceKind => (STAGES as readonly string[]).includes(s)),
+    stages: rawStages.filter((s): s is StageName => (STAGES as readonly string[]).includes(s)),
     full: values.full === true,
     maxWork,
     datasets: values.dataset ?? [],
@@ -130,12 +143,25 @@ const printItems = (items: Item[], limit: number): void => {
   }
 };
 
-const COMMANDS = ["collect", "bulk", "serve", "status", "alerts", "search", "recall", "tail", "help"] as const;
+const COMMANDS = ["collect", "bulk", "serve", "status", "alerts", "search", "recall", "reset", "tail", "help"] as const;
 type Command = (typeof COMMANDS)[number];
 
 const isCommand = (value: string): value is Command => (COMMANDS as readonly string[]).includes(value);
 
+// .env 只补缺失的变量 (process.loadEnvFile 不覆盖已存在的环境变量),
+// 因此 CI / shell 里显式给的值优先级更高。
+const loadDotEnv = (): void => {
+  const path = resolve(process.cwd(), ".env");
+  if (!existsSync(path)) return;
+  try {
+    process.loadEnvFile(path);
+  } catch (error) {
+    process.stderr.write(`警告: 无法读取 .env: ${(error as Error).message}\n`);
+  }
+};
+
 const main = async (): Promise<number> => {
+  loadDotEnv();
   const options = parse(process.argv.slice(2));
   if (!isCommand(options.command)) {
     process.stderr.write(`未知命令: ${options.command}\n\n${USAGE}`);
@@ -276,8 +302,10 @@ const main = async (): Promise<number> => {
         process.stdout.write(`队列: 待处理 ${pending}, 失败 ${failed}\n`);
         process.stdout.write(`sitemap 分页缓存 ${store.sitemapPageCount()} 页\n`);
         const docs = store.documentStats();
+        const ocrPending = store.ocrPendingCount();
         process.stdout.write(
           `正文库: ${docs.total} 篇 (成功 ${docs.ok} / 失败 ${docs.failed}), ${docs.chars} 字符, 待抓 ${store.pendingDocumentCount()} 个 URL` +
+            `${ocrPending > 0 ? `, 待 OCR ${ocrPending} 篇` : ""}` +
             `${store.ftsEnabled ? ", FTS5 已启用" : ", FTS5 不可用 (降级为 LIKE)"}\n`,
         );
         if (docs.byKind.length > 0) {
@@ -349,6 +377,16 @@ const main = async (): Promise<number> => {
           if (hit.snippet.length > 0) {
             process.stdout.write(`  …${hit.snippet.replace(/\s+/g, " ").slice(0, 300)}…\n`);
           }
+        }
+        return 0;
+      }
+      case "reset": {
+        const lock = acquireLock(config.dataDir);
+        try {
+          const cleared = store.resetDocumentFailures();
+          process.stdout.write(`已清除 ${cleared} 条假失败记录 (403/429/超体积), 它们会重新成为待抓项\n`);
+        } finally {
+          lock.release();
         }
         return 0;
       }
