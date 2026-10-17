@@ -44,8 +44,9 @@ pnpm run recall "surrogate endpoint"
 正文抓取也可以单独跑, 不重扫 sitemap, 只消费库里已有的 URL:
 
 ```bash
-pnpm run collect -- --stage content
-pnpm run collect -- --stage content --full   # 循环跑完所有待抓 (直到限流或抓完)
+pnpm run content                    # 抓一批 (content.batchSize 篇)
+pnpm run content --verbose          # 同上, 带逐篇明细与进度
+pnpm run content:full --verbose     # 循环跑完所有待抓 (长期任务, 建议放 tmux)
 ```
 
 > **速率与限流**: `content.concurrency` 只决定同时在飞的请求数, 平均速率由
@@ -190,17 +191,59 @@ openFDA 的日期字段是**报告日期**, 而记录会被持续补录到历史
 
 ## 快速开始
 
+最快的一次完整流程 (三步):
+
 ```bash
 pnpm install
-pnpm run collect              # 跑全部通道
-pnpm run serve                # 启动本地搜索界面 (http://127.0.0.1:8787)
-pnpm run status               # 查看运行历史 / 游标 / 队列 / 正文库
-pnpm run alerts               # 历史告警
-pnpm run search <关键词>       # 在已落库条目中检索 (标题 / 摘要 / URL)
-pnpm run recall <关键词>       # 在正文库中全文检索 (FTS5)
-pnpm test                     # 单元测试 (node:test)
-pnpm run typecheck            # 类型检查
+pnpm run ocr:setup            # 一次性: 装本地 OCR 运行时 (~30 MB)
+pnpm run collect --verbose    # 建索引 + 抓首批正文 (首轮约 45 分钟)
 ```
+
+之后长期抓完剩余正文 (8.6 万个 URL, 约 2-3 天):
+
+```bash
+pnpm run content:full --verbose    # 建议放在 tmux 里, 中断后重跑会从断点继续
+```
+
+### 全部命令
+
+日常使用:
+
+| 命令 | 作用 |
+| --- | --- |
+| `pnpm run collect` | 跑全部通道 (RSS + openFDA + sitemap + 一批正文) |
+| `pnpm run collect --verbose` (= `pnpm run collect:verbose`) | 同上, 输出每个通道的明细与进度 |
+| `pnpm run collect:full` | 全通道 + 忽略条件请求缓存 + 解除正文批数限制 |
+| `pnpm run status` | 运行历史 / 游标 / 队列 / 正文库统计 |
+| `pnpm run serve` | 启动本地搜索界面 (http://127.0.0.1:8787) |
+| `pnpm run search <关键词>` | 在已落库条目中检索 (标题 / 摘要 / URL) |
+| `pnpm run recall <关键词>` | 在正文库中全文检索 (FTS5) |
+| `pnpm run alerts` | 历史告警 |
+| `pnpm run tail [n]` | 最近 n 条已落库条目 (默认 20) |
+
+单通道 / 正文:
+
+| 命令 | 作用 |
+| --- | --- |
+| `pnpm run collect:rss` | 只跑 RSS (16 个 feed) |
+| `pnpm run collect:openfda` | 只跑 openFDA API (8 个数据集) |
+| `pnpm run collect:sitemap` | 只跑 sitemap, 并在其后抓一批正文 |
+| `pnpm run content` | 只抓一批正文, 不重扫 sitemap |
+| `pnpm run content:full` | 只抓正文, 循环跑完所有待抓 |
+
+维护:
+
+| 命令 | 作用 |
+| --- | --- |
+| `pnpm run bulk` | 走 openFDA 官方批量下载通道补历史 |
+| `pnpm run reset` | 清除正文库里的假失败 (403/429/超体积), 让它们重新待抓 |
+| `pnpm run ocr:setup` | 安装本地 OCR 运行时 (PDFium + ONNX Runtime) |
+| `pnpm test` | 单元测试 (node:test, 不联网) |
+| `pnpm run typecheck` | 类型检查 |
+
+> **不要写 `pnpm run collect -- --stage content`**: pnpm 会把 `--` 原样传进 `argv`,
+> 早期版本因此静默丢弃全部开关。现已修复并在解析前剔除, 但仍建议直接用 `content` /
+> `content:full` 别名, 既简短又不依赖 `--` 的传参行为。
 
 要求 Node >= 24 (使用原生 TypeScript 类型剥离与 `node:sqlite`, 无构建步骤, 无第三方运行时框架)。
 正文通道额外依赖 `@firecrawl/pdf-inspector` (PDF 分类、markdown 抽取与本地 OCR)、
