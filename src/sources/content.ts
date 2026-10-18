@@ -252,9 +252,9 @@ const fetchOne = async (url: string, ctx: FetchContext): Promise<void> => {
         progress(`  ! ${url} ${extracted.pdf.ocrFailed} 页 OCR 未产出文本${detail}`);
       }
       if (extracted.text.length === 0) progress(`  ! ${url} 提取到 0 字符 (${extracted.kind})`);
-      // 表格类附件常超过上限被截断。截断本身不失败, 但正文被砍掉一半意味着
-      // 检索可能漏掉后半部分, 需要能在日志里看到而不是悄悄发生。
-      else if (extracted.text.length >= config.maxTextChars) {
+      // maxTextChars 默认为 null (不限制)。设了上限且正好触顶时提示, 否则内容的
+      // 截断会悄悄发生, 而检索不到后半部分这件事很难被发现。
+      else if (config.maxTextChars !== null && extracted.text.length >= config.maxTextChars) {
         progress(`  ! ${url} 正文达到上限 ${config.maxTextChars} 字符, 后续内容已丢弃 (${extracted.kind})`);
       }
       gate.noteSuccess();

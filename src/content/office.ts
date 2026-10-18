@@ -1,5 +1,5 @@
 import { Unzip, UnzipInflate } from "fflate";
-import { decodeEntities, normalizeText, officeKindOf } from "./extract.ts";
+import { decodeEntities, officeKindOf } from "./extract.ts";
 
 // Office 文档是 zip + XML。不能用 unzipSync 一次性解压: FDA 的 xlsx 附件里
 // 单个 sheet1.xml 解压后可达 358 MB (57 MB 的 xlsx), 整块进堆会直接 OOM。
@@ -26,12 +26,16 @@ interface Budget {
 
 const ENTITY_TAIL = /&[a-zA-Z#0-9]{0,10}$/;
 
-// 流式 XML 文本抽取: 只保留标签之外的文字, 块级边界补换行, 与 xmlPartsToText 同义。
+// 流式 XML 文本抽取: 只保留标签之外的文字, 块级边界补换行。
 class PartSink {
   readonly #decoder = new TextDecoder("utf-8", { fatal: false });
   readonly #budget: Budget;
   readonly #parts: string[] = [];
   #carry = "";
+  // 上一个块末尾尚未落盘的空白。旧实现会对整串跑一次 normalizeText, 其中的
+  // 空白折叠、"\n{3,}" 收缩与首尾 trim 都是全局语义; 分块时必须把跨块的空白
+  // 留到下一块开头一起处理, 否则块边界会多出空格或空行。
+  #pending = "";
 
   constructor(budget: Budget) {
     this.#budget = budget;
@@ -73,12 +77,24 @@ class PartSink {
   }
 
   #append(body: string): void {
-    // 预算按"读入的原始 XML"扣减, 与实际产出的文字量无关: 截断点因此落在
-    // 原始流的固定位置, 且总量由 maxChars * RAW_FACTOR 兜住。
     const raw = Math.min(body.length, this.#budget.remaining);
     this.#budget.remaining -= raw;
     const plain = decodeEntities(body.slice(0, raw).replace(BLOCK_END, "\n").replace(BREAK, "\n").replace(/<[^>]*>/g, " "));
-    if (plain.length > 0) this.#parts.push(plain);
+    if (plain.length === 0) return;
+    // 块内先按 normalizeText 的规则收敛空白, 再与上一块遗留的空白拼接后统一
+    // 收敛一次。这样跨块与块内得到的结果一致, 又不必最后对整串 (可能上亿字符)
+    // 再跑一遍 normalizeText —— 那一步会在内存里同时留下 4 份完整拷贝。
+    const collapsed = plain.replace(/[^\S\n]+/g, " ").replace(/ *\n */g, "\n");
+    const merged = (this.#pending + collapsed)
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ *\n */g, "\n")
+      .replace(/\n{3,}/g, "\n\n");
+    // 末尾的空白留到下一块: 只有确认后面还有内容, 它才是"词间分隔符"而不是
+    // 需要被 trim 掉的尾部空白。开头的空白同理, 一并丢给这一步处理。
+    const kept = merged.length - merged.replace(/\s+$/, "").length;
+    this.#pending = merged.slice(merged.length - kept);
+    const piece = merged.slice(0, merged.length - kept).replace(/^\s+/, "");
+    if (piece.length > 0) this.#parts.push(piece);
   }
 }
 
@@ -107,8 +123,9 @@ const streamParts = (bytes: Uint8Array, accept: (name: string) => Budget | null,
   return names;
 };
 
-export const extractOfficeText = (bytes: Uint8Array, maxChars: number): string => {
-  const limit = Math.max(1, Math.floor(maxChars));
+// maxChars 为 null 表示不截断。
+export const extractOfficeText = (bytes: Uint8Array, maxChars: number | null): string => {
+  const limit = maxChars === null ? Number.MAX_SAFE_INTEGER : Math.max(1, Math.floor(maxChars));
   const raw = Math.max(1, Math.floor(limit * RAW_FACTOR));
   // xlsx 的 sharedStrings 与 worksheets 分开预算, 不能共用: zip 内部件顺序不保证
   // (实测 sheet 在前), 若共用, 先到的 sheet 会把预算吃光, 后到的 sharedStrings
@@ -137,5 +154,6 @@ export const extractOfficeText = (bytes: Uint8Array, maxChars: number): string =
   const wanted = [...sinks.entries()].filter(([name]) => name.startsWith(prefix));
   // sharedStrings 排在最前: 文字都在那里, 截断时优先留下可检索的内容。
   wanted.sort(([a], [b]) => (a === "xl/sharedStrings.xml" ? -1 : b === "xl/sharedStrings.xml" ? 1 : 0));
-  return normalizeText(wanted.map(([, sink]) => sink.text()).join("\n")).slice(0, limit);
+  const text = wanted.map(([, sink]) => sink.text()).join("\n");
+  return text.length > limit ? text.slice(0, limit) : text;
 };

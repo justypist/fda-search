@@ -23,7 +23,7 @@ const CONTENT_DEFAULTS: ContentConfig = {
   pdf: true,
   office: true,
   maxBytes: 64 * 1024 * 1024,
-  maxTextChars: 2_000_000,
+  maxTextChars: null,
   ocr: true,
   ocrEngine: "local",
   ocrMaxPages: 8,
@@ -165,9 +165,10 @@ export const loadConfig = (cwd: string, configPath: string): Config => {
     pdf: typeof contentObj.pdf === "boolean" ? contentObj.pdf : CONTENT_DEFAULTS.pdf,
     office: typeof contentObj.office === "boolean" ? contentObj.office : CONTENT_DEFAULTS.office,
     maxBytes: typeof contentObj.maxBytes === "number" ? contentObj.maxBytes : CONTENT_DEFAULTS.maxBytes,
+    // 未配置或 0 表示不限制; 负数视为配置错误, 同样按不限制处理。
     maxTextChars: typeof contentObj.maxTextChars === "number" && contentObj.maxTextChars >= 1
       ? Math.floor(contentObj.maxTextChars)
-      : CONTENT_DEFAULTS.maxTextChars,
+      : null,
     ocr: typeof contentObj.ocr === "boolean" ? contentObj.ocr : CONTENT_DEFAULTS.ocr,
     ocrEngine: contentObj.ocrEngine === "vision" || contentObj.ocrEngine === "off" || contentObj.ocrEngine === "local"
       ? contentObj.ocrEngine

@@ -460,3 +460,45 @@ test("回归: 无论 sheet 还是 sharedStrings 先到, 都不挤掉文字", () 
     assert.ok(text.includes("Listeria 0") && text.includes("Listeria 499"), `部件顺序不应影响文字提取, 实得 ${text.slice(0, 80)}`);
   }
 });
+
+test("回归: Office 空白归一化与整串 normalizeText 等价 (含块边界)", () => {
+  // 分块归一化必须复现 normalizeText 的全局语义: 空白折叠、\n{3,} 收缩、首尾 trim。
+  // 下面每个用例都曾在分块实现里出过错, 或专门覆盖块边界。
+  const reference = (xml: string): string =>
+    normalizeText(
+      decodeEntities(
+        xml
+          .replace(/<\/(w:p|w:tr|a:p|row|c)>/gi, "\n")
+          .replace(/<(w:br|w:tab|a:br)\b[^>]*\/?>/gi, "\n")
+          .replace(/<[^>]*>/g, " "),
+      ),
+    );
+  const bodies = [
+    `<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p><w:r><w:t>b</w:t></w:r></w:p>`,
+    `<w:p><w:r><w:t>spaced </w:t></w:r></w:p><w:p><w:r><w:t> words</w:t></w:r></w:p>`,
+    `<w:p><w:r><w:t>a</w:t></w:r></w:p><w:p></w:p><w:p></w:p><w:p><w:r><w:t>b</w:t></w:r></w:p>`,
+    `<w:p><w:r><w:t>  </w:t></w:r></w:p><w:p><w:r><w:t>x</w:t></w:r></w:p>`,
+    `<w:p><w:r><w:t>tail </w:t></w:r></w:p>`,
+    `<w:p><w:r><w:t>line1</w:t></w:r><w:r><w:br/></w:r><w:r><w:t>line2</w:t></w:r></w:p>`,
+  ];
+  for (const body of bodies) {
+    const xml = `<w:document><w:body>${body}</w:body></w:document>`;
+    const docx = zipSync({ "[Content_Types].xml": strToU8("<T/>"), "word/document.xml": strToU8(xml) });
+    assert.equal(extractOfficeText(docx, null), reference(xml), body);
+  }
+});
+
+test("回归: 不设上限时正文完整保留, 不按部件截断", () => {
+  const rows = Array.from({ length: 5000 }, (_, i) => `<row r="${i + 1}"><c t="s"><v>${i}</v></c></row>`).join("");
+  const strings = Array.from({ length: 5000 }, (_, i) => `<si><t>Listeria ${i}</t></si>`).join("");
+  const xlsx = zipSync({
+    "[Content_Types].xml": strToU8("<T/>"),
+    "xl/worksheets/sheet1.xml": strToU8(`<worksheet><sheetData>${rows}</sheetData></worksheet>`),
+    "xl/sharedStrings.xml": strToU8(`<sst>${strings}</sst>`),
+  });
+  const full = extractOfficeText(xlsx, null);
+  assert.ok(full.includes("Listeria 0") && full.includes("Listeria 4999"), "两端的文字都要在");
+  assert.ok(!full.includes("  ") && !full.includes("\n\n\n") && full === full.trim(), "归一化结果要干净");
+  // 显式给上限时才截断。
+  assert.equal(extractOfficeText(xlsx, 100).length, 100);
+});

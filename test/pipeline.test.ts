@@ -93,6 +93,7 @@ const makeHarness = (): Harness => {
       pdf: true,
       office: true,
       maxBytes: 1e7,
+      maxTextChars: null,
       ocr: false,
       ocrMaxPages: 8,
       ocrConcurrency: 4,

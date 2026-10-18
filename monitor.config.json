@@ -59,7 +59,6 @@
     "pdf": true,
     "office": true,
     "maxBytes": 67108864,
-    "maxTextChars": 2000000,
     "ocr": true,
     "ocrEngine": "local",
     "ocrMaxPages": 8,
