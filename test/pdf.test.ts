@@ -241,3 +241,66 @@ test("视觉模型配置: 三项齐全才启用, 任一缺失即关闭", () => {
     { baseUrl: "http://x/v1", apiKey: "k", model: "vision", concurrency: 3 },
   );
 });
+
+// --- 本地 OCR 无文字时用视觉模型兜底 ---
+
+test("回归: 本地 OCR 认不出文字的页, 交给视觉模型兜底", async () => {
+  // 页面有可见内容 (不是空白页, 否则会被跳过), 但本地引擎一个字符也读不出来。
+  const sheet = createCanvas(612, 792);
+  const ctx = sheet.getContext("2d");
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, 612, 792);
+  ctx.fillStyle = "#000000";
+  // 画几条粗线: 有非白像素, 但不是可识别的文字。
+  for (let i = 0; i < 12; i += 1) ctx.fillRect(60, 100 + i * 40, 400, 8);
+  const jpeg = Buffer.from(sheet.toBuffer("image/jpeg", 0.9));
+  const content = Buffer.from("q 612 0 0 792 0 0 cm /Im0 Do Q", "latin1");
+  const pdf = assemblePdf(
+    [
+      { id: 1, body: Buffer.from("<< /Type /Catalog /Pages 2 0 R >>", "latin1") },
+      { id: 2, body: Buffer.from("<< /Type /Pages /Kids [3 0 R] /Count 1 >>", "latin1") },
+      {
+        id: 3,
+        body: Buffer.from(
+          "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+          "latin1",
+        ),
+      },
+      streamObject(4, "", content),
+      streamObject(
+        5,
+        "/Type /XObject /Subtype /Image /Width 612 /Height 792 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+        jpeg,
+      ),
+    ],
+    1,
+  );
+
+  const withoutLlm = await extractDocument(pdf, "application/pdf", "https://www.fda.gov/media/20/download", { engine: "local" });
+  assert.equal(withoutLlm.pdf?.ocrMissing, false, "运行时可用, 不应标成待 OCR");
+
+  const vision = stubVision("# Rescued by LLM\n\nRecall notice text");
+  const withLlm = await extractDocument(pdf, "application/pdf", "https://www.fda.gov/media/20/download", {
+    engine: "local",
+    vision,
+  });
+  assert.ok(withLlm.text.includes("Rescued by LLM"), `LLM 兜底应补上正文, 实得 ${JSON.stringify(withLlm.text.slice(0, 80))}`);
+  assert.equal(vision.calls, 1, "只应把没有文字的页交给视觉模型");
+  assert.equal(withLlm.pdf?.ocrFailed, 0, "兜底成功就不算 OCR 失败");
+});
+
+test("回归: 本地 OCR 正常产出时不调用视觉模型", async () => {
+  const vision = stubVision("不应被调用");
+  const out = await extractDocument(makeScannedPdf(), "application/pdf", "https://www.fda.gov/media/21/download", {
+    engine: "local",
+    vision,
+  });
+  assert.equal(vision.calls, 0, "本地引擎已读出文字, 不该额外产生 API 费用");
+  assert.ok(out.text.length > 0);
+});
+
+test("回归: 没有配置视觉模型时, 本地 OCR 空结果不虚报 OCR 失败", async () => {
+  const out = await extractDocument(makeTextPdf(), "application/pdf", "https://www.fda.gov/media/22/download", { engine: "local" });
+  assert.equal(out.pdf?.ocrFailed, 0);
+  assert.equal(out.pdf?.ocrPages.length, 0);
+});

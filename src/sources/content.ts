@@ -294,21 +294,20 @@ export const collectContent = async (
   progress: (message: string) => void,
   limits: { batchSize: number; gate?: RequestGate; vision?: VisionClient | null },
 ): Promise<ContentStat> => {
-  // 只有视觉引擎需要模型客户端; 本地 PP-OCR 不读 .env。
+  // 只有视觉引擎需要模型客户端; 本地 PP-OCR 不读 .env。但本地引擎识别不出文字的
+  // 页会用视觉模型兜底, 所以 local 引擎下也尝试创建它 —— 没配置就是 null, 行为不变。
   const vision = limits.vision !== undefined
     ? limits.vision
-    : config.ocrEngine === "vision"
-      ? createVisionFromEnv(process.env, config.ocrConcurrency)
-      : null;
+    : !config.ocr || config.ocrEngine === "off"
+      ? null
+      : createVisionFromEnv(process.env, config.ocrConcurrency);
   const engine = !config.ocr ? "off" : config.ocrEngine;
-  if (engine === "vision" && vision !== null) {
-    // 只在 OCR 真的可用时才重排: 否则会"删除 -> 重抓 -> 又标回待 OCR"无限循环。
+  // "待 OCR" 记录意味着当初根本没做成 OCR, 只要引擎 (或兜底模型) 能用就该重排。
+  // vision 引擎在没有模型时必须跳过, 否则会"删除 -> 重抓 -> 又标回待 OCR"循环。
+  const canOcr = engine === "vision" ? vision !== null : engine === "local";
+  if (canOcr) {
     const requeued = store.resetOcrSkipped();
     if (requeued > 0) progress(`  ~ OCR 已就绪, 重新排队 ${requeued} 个此前跳过的扫描件`);
-  } else if (engine === "local") {
-    // 本地引擎同样能让此前跳过 (或视觉模型超时) 的扫描件重新排队。
-    const requeued = store.resetOcrSkipped();
-    if (requeued > 0) progress(`  ~ 本地 OCR 已就绪, 重新排队 ${requeued} 个此前跳过的扫描件`);
   }
 
   const urls = pendingContentUrls(store, config, limits.batchSize);

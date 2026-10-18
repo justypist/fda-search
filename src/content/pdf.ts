@@ -15,6 +15,10 @@ const LOCAL_OCR_READY = applyOcrRuntime();
 //   local  — pdf-inspector 内置的 PP-OCRv6 (ONNX), 纯本地 CPU, 实测 2 页 2.8 秒;
 //   vision — 视觉模型 (需 .env), 质量更高但单页要 20-90 秒且按 token 计费。
 // 默认 local: 快一到两个数量级, 对扫描件这种版式固定的文档质量已足够。
+//
+// local 引擎下, 某些页可能一页也识别不出文字 (版式异常、字迹过淡、图像过小)。
+// 这类页在配置了视觉模型时再交给 LLM 转写一次 —— 本地 OCR 已证明该页有内容,
+// 只是自己读不出来, 这正是视觉模型擅长的情形。没有配置 LLM 时行为不变。
 
 export type OcrEngine = "local" | "vision" | "off";
 
@@ -24,6 +28,8 @@ export interface PdfExtraction extends Extracted {
   ocrApplied: number;
   ocrFailed: number;
   ocrErrors: string[];
+  // 送去 OCR 但整页没有任何非白像素的页。它们本来就没有内容, 不算 OCR 失败。
+  ocrBlank: number[];
   // 有页面需要 OCR 但引擎不可用 (缺 PDFium/ONNX, 或未配置视觉模型)。
   // 上层据此把文档标记为"待 OCR", 而不是当作已抓完的空正文。
   ocrMissing: boolean;
@@ -72,28 +78,41 @@ interface PageText {
   needsOcr: boolean;
 }
 
+// 视觉模型对空白页有时会回一句 "Empty response." 之类的说明文字, 而提示词要求
+// "没有可读文字时返回空响应"。这些句子不是正文, 落进库里会污染检索结果。
+const EMPTY_MARKERS = /^(empty (response|transcription|page)\.?|no (legible )?text( found)?\.?)$/i;
+
+const cleanTranscription = (text: string): string => {
+  const trimmed = text.trim();
+  return EMPTY_MARKERS.test(trimmed) ? "" : trimmed;
+};
+
+// targets 为 null 时取 needsOcr 的页; 否则只处理指定的页 (本地引擎失败后的兜底)。
 const applyVision = async (
   bytes: Uint8Array,
   pages: PageText[],
   vision: VisionClient,
   maxOcrPages: number,
-): Promise<{ text: Map<number, string>; failed: number; errors: string[] }> => {
-  const ocrPages = pages.filter((page) => page.needsOcr).map((page) => page.page);
+  targets: number[] | null = null,
+): Promise<{ text: Map<number, string>; failed: number; errors: string[]; skipped: Set<number> }> => {
+  const ocrPages = targets ?? pages.filter((page) => page.needsOcr).map((page) => page.page);
   const text = new Map<number, string>();
   const errors: string[] = [];
   let failed = 0;
-  if (ocrPages.length === 0) return { text, failed, errors };
+  if (ocrPages.length === 0) return { text, failed, errors, skipped: new Set() };
 
   // 只 OCR 前 N 页: 扫描件常有几十页, 全量转写的成本远超检索收益。
-  const targets = ocrPages.slice(0, Math.max(1, maxOcrPages));
+  const selected = ocrPages.slice(0, Math.max(1, maxOcrPages));
   // pdf-inspector 的页号是 0 基, pdfjs 的 getPage 是 1 基。
-  const images = await extractPdfPageImages(bytes, targets.map((page) => page + 1));
+  const images = await extractPdfPageImages(bytes, selected.map((page) => page + 1));
+  // 空白页直接跳过: 送去做转写只会换回一句 "Empty response.", 白花一次调用。
+  const skipped = new Set(images.filter((image) => image.blank).map((image) => image.page - 1));
   const results = await Promise.all(
     images
-      .filter((image) => targets.includes(image.page - 1))
+      .filter((image) => selected.includes(image.page - 1) && !image.blank)
       .map(async (image) => {
         try {
-          return { page: image.page - 1, text: await vision.transcribe([image.data]), error: null };
+          return { page: image.page - 1, text: cleanTranscription(await vision.transcribe([image.data])), error: null };
         } catch (error) {
           return { page: image.page - 1, text: "", error: (error as Error).message.slice(0, 200) };
         }
@@ -106,7 +125,8 @@ const applyVision = async (
       if (result.error !== null) errors.push(`p${result.page + 1}: ${result.error}`);
     }
   }
-  return { text, failed, errors };
+  // 空白页不算失败: 它本来就没有内容, 计入失败会让统计看起来像 OCR 出了问题。
+  return { text, failed, errors, skipped };
 };
 
 interface LocalOcrOutput {
@@ -174,22 +194,43 @@ export const extractPdfWithInspector = async (bytes: Uint8Array, options: PdfExt
   if (options.engine === "local") {
     const out = await localOcr(buffer, options.maxOcrPages);
     const ordered = out.pages.map((page) => ({ page: page.page, markdown: stripFences(page.markdown) }));
-    const markdown = ordered.map((page) => page.markdown).filter((part) => part.length > 0).join("\n\n").trim();
-    // 只统计真正送去 OCR 的页。文本型 PDF 的 out.ocrPages 为空, 若按"非空页数"
-    // 计算, 会把纯文本页虚报成 OCR 页, 也会把空白页误报成 OCR 失败。
+    // 本地 OCR 送去却一页也没读出文字的页。配置了视觉模型时交给它兜底:
+    // 本地引擎认不出不等于没有内容, 直接留空会让这篇文档永远检索不到。
     const ocrPages = out.unavailable ? [] : out.ocrPages;
-    const filled = ordered.filter((page) => ocrPages.includes(page.page) && page.markdown.length > 0).length;
+    const failedPages = ordered.filter((page) => ocrPages.includes(page.page) && page.markdown.length === 0).map((page) => page.page);
+    // 整篇没有文字的情形 (扫描件被误判为文本型, 或全是矢量图形): 本地引擎没有标记
+    // 任何页需要 OCR, 于是也没有失败页, 文档会静默变成空正文。把前 N 页交给视觉模型。
+    const wholeBlank = ocrPages.length === 0 && ordered.every((page) => page.markdown.length === 0);
+    const emptyPages = wholeBlank ? ordered.slice(0, Math.max(1, options.maxOcrPages)).map((page) => page.page) : failedPages;
+    const fallback = options.vision !== null && emptyPages.length > 0
+      ? await applyVision(bytes, out.pages, options.vision, options.maxOcrPages, emptyPages)
+      : { text: new Map<number, string>(), failed: 0, errors: [], skipped: new Set<number>() };
+    // 交给视觉模型兜底的页也算"需要 OCR"的页, 统计口径才与 ocrApplied/Failed 一致。
+    // 没有兜底模型时这些页并未尝试 OCR, 不能算进分母 (否则会虚报 OCR 失败)。
+    const attempted = options.vision !== null && emptyPages.length > 0;
+    const allOcrPages = attempted ? [...new Set([...ocrPages, ...emptyPages])].sort((a, b) => a - b) : ocrPages;
+    const filled = ordered.map((page) => ({
+      page: page.page,
+      markdown: fallback.text.get(page.page) ?? page.markdown,
+    }));
+    const markdown = filled.map((page) => page.markdown).filter((part) => part.length > 0).join("\n\n").trim();
+    // 只统计真正送去 OCR 的页。文本型 PDF 的 ocrPages 为空, 若按"非空页数"
+    // 计算, 会把纯文本页虚报成 OCR 页, 也会把空白页误报成 OCR 失败。
+    const done = filled.filter((page) => allOcrPages.includes(page.page) && page.markdown.length > 0).length;
+    const blankPages = [...fallback.skipped].sort((a, b) => a - b);
     return {
       kind: "pdf",
-      title: titleFromPages(ordered, firstHeading(markdown)),
+      title: titleFromPages(filled, firstHeading(markdown)),
       text: markdown,
       date: null,
       pdfType: out.pdfType,
       pageCount: out.pageCount,
-      ocrPages,
-      ocrApplied: filled,
-      ocrFailed: ocrPages.length - filled,
-      ocrErrors: [],
+      ocrPages: allOcrPages,
+      ocrApplied: done,
+      // 空白页不是失败: 它本来就没有内容, 计入失败会让统计看起来像 OCR 出了问题。
+      ocrFailed: Math.max(0, allOcrPages.length - done - blankPages.length),
+      ocrErrors: fallback.errors,
+      ocrBlank: blankPages,
       ocrMissing: out.unavailable,
     };
   }
@@ -202,7 +243,7 @@ export const extractPdfWithInspector = async (bytes: Uint8Array, options: PdfExt
 
   const visionResult = options.vision !== null && ocrPages.length > 0
     ? await applyVision(bytes, pages, options.vision, options.maxOcrPages)
-    : { text: new Map<number, string>(), failed: 0, errors: [] };
+    : { text: new Map<number, string>(), failed: 0, errors: [], skipped: new Set<number>() };
 
   const cleaned = pages.map((page) => ({
     page: page.page,
@@ -221,6 +262,7 @@ export const extractPdfWithInspector = async (bytes: Uint8Array, options: PdfExt
     ocrApplied: visionResult.text.size,
     ocrFailed: visionResult.failed,
     ocrErrors: visionResult.errors,
+    ocrBlank: [...visionResult.skipped].sort((a, b) => a - b),
     ocrMissing,
   };
 };
