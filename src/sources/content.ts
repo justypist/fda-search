@@ -198,6 +198,7 @@ const fetchOne = async (url: string, ctx: FetchContext): Promise<void> => {
         engine,
         vision: engine === "vision" ? vision : null,
         ocrMaxPages: config.ocrMaxPages,
+        maxTextChars: config.maxTextChars,
       });
       // 扫描件但 OCR 不可用 (引擎关闭 / 视觉模型未配置): 落成功行会把它标成
       // "已抓完且正文为空", 之后配好 OCR 也不会再重试。改记一条专门的错误行 ——
@@ -251,6 +252,11 @@ const fetchOne = async (url: string, ctx: FetchContext): Promise<void> => {
         progress(`  ! ${url} ${extracted.pdf.ocrFailed} 页 OCR 未产出文本${detail}`);
       }
       if (extracted.text.length === 0) progress(`  ! ${url} 提取到 0 字符 (${extracted.kind})`);
+      // 表格类附件常超过上限被截断。截断本身不失败, 但正文被砍掉一半意味着
+      // 检索可能漏掉后半部分, 需要能在日志里看到而不是悄悄发生。
+      else if (extracted.text.length >= config.maxTextChars) {
+        progress(`  ! ${url} 正文达到上限 ${config.maxTextChars} 字符, 后续内容已丢弃 (${extracted.kind})`);
+      }
       gate.noteSuccess();
       return;
     } catch (error) {

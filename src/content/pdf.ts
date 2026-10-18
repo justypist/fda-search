@@ -141,9 +141,18 @@ const localOcr = async (buffer: Buffer, maxOcrPages: number): Promise<LocalOcrOu
     // 在 verbatimModuleSyntax 下不可导入, 传字面量也不合法, 故省略。
     result = await processPdfWithOcr(buffer, { pageNumbers: selected.map((page) => page + 1) });
   } catch {
-    // 缺 PDFium / ONNX Runtime 时本地 OCR 不可用。必须如实上报, 否则扫描件会被
-    // 当成"成功但正文为空"落库, 之后配好运行时也不会重试。
-    return keep(true, selected);
+    // 运行时确实缺失时, 扫描件必须如实记为"待 OCR", 否则会被当成
+    // "成功但正文为空"落库, 之后配好运行时也不会重试。
+    if (!LOCAL_OCR_READY) return keep(true, selected);
+    // 运行时可用却报错, 多半是单页异常: 实测有 PDF 的页面大到 150 DPI 栅格化
+    // 需要 271 MB (上限 256 MB), 整篇因此失败。这不是"OCR 未配置",
+    // 若按待 OCR 处理, 每轮都会重新下载再失败一次。先降 DPI 重试;
+    // 仍失败就照常返回原生文本, 由上层按 OCR 失败计数。
+    try {
+      result = await processPdfWithOcr(buffer, { pageNumbers: selected.map((page) => page + 1), dpi: 96 });
+    } catch {
+      return keep(false, selected);
+    }
   }
 
   // 本地 OCR 的输出是整篇 markdown; 分页结果在 result.pages 里 (1 基页号)。

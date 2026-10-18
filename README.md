@@ -85,6 +85,7 @@ pnpm run content:full --verbose     # 循环跑完所有待抓 (长期任务, �
 | `ocrMaxPages` | `8` | 单个 PDF 最多 OCR 多少页 |
 | `ocrConcurrency` | `1` | 视觉模型的并发请求数上限 (仅 `vision` 引擎) |
 | `maxBytes` | `64 MiB` | 单个文件上限, 超过则跳过并记为失败 |
+| `maxTextChars` | `2000000` | 单篇正文保留的字符上限, 超出部分丢弃 |
 | `match` | `false` | 正文是否参与关键词告警 (见下) |
 
 **关于 `match`**: 默认关闭。打开后正文也会走关键词规则, 但补齐历史存量时会让大量旧页面
@@ -308,6 +309,7 @@ open 'http://127.0.0.1:8787/?q=listeria'
     "pdf": true,             // 解析 PDF
     "office": true,          // 解析 xlsx / docx / pptx
     "maxBytes": 67108864,    // 单文件上限 64 MiB
+    "maxTextChars": 2000000, // 单篇正文保留的字符上限, 超出丢弃
     "match": false           // 正文是否参与关键词告警
   },
   "openfda": {
@@ -489,6 +491,8 @@ sitemap 落库的 URL  →  正文抓取 (sources/content)  →  documents 表 (
 | 正文通道开了却一篇也抓不到 | 过滤原先在取完固定窗口后才在内存里做, 窄 `include` (如只要 `/media/`) 永远只看到列表最前面那批不匹配的 URL | 过滤条件下推到 SQL, 见 `Store.pendingDocumentUrls` |
 | 正文抓取永久卡住 | 失败的 URL 不落库, 于是每一轮都重试同一批坏 URL | 失败也写一行 (带 `error`), 已抓过的无论成败都不再返回 |
 | PDF 正文提取失败并刷警告 | pdfjs 在 Node 下的 legacy 构建走 `fs.readFile`, 只认文件系统路径; 传 `file://` URL 会报 `Unable to load font data` | 传目录路径 (`standardFontDataUrl` / `cMapUrl`), 用 `createRequire` 定位 |
+| 正文抓取跑到几百篇就 OOM | Office 文档原先用 `unzipSync` 整块解压: 一份 57 MB 的 xlsx 内部 `sheet1.xml` 解压后 358 MB、`sharedStrings.xml` 150 MB, 连同 `strFromU8` 与多次 `replace` 的拷贝直接冲爆 4 GB 堆 | 改为 fflate 流式解压 (1 MB 分块), 边解压边剥标签, 内存与文档大小无关; 另设 `maxTextChars` 截断, 实测同一文件峰值 105 MB |
+| 扫描件反复出现 "待 OCR" | 运行时可用但单页栅格化超限 (实测某页 150 DPI 需要 271 MB, 上限 256 MB) 被误判为 "OCR 未配置", 于是每轮重新下载再失败 | 区分"运行时缺失"与"单页失败": 后者先降 DPI 重试, 仍失败则照常返回原生文本并计入 OCR 失败 |
 
 > RSS 补充: 条件请求在本站基本失效, 因此每轮仍会拉取全部 16 个 feed (受 crawl-delay 约束约 8 分钟)。
 > 但内容指纹让"未变化"的 feed 不入队, 配合 `guid` 主键去重, 重复拉取不会产生重复告警或重复处理。

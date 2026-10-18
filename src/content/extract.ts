@@ -105,26 +105,15 @@ const XML_ENTRY_PATTERNS: { kind: DocKind; entries: RegExp }[] = [
   { kind: "pptx", entries: /^ppt\/(slides|notesSlides)\/[^/]+\.xml$/ },
 ];
 
-export interface ZipEntries {
-  kind: DocKind;
-  texts: string[];
-}
+export const officeEntriesOf = (kind: DocKind): RegExp | null =>
+  XML_ENTRY_PATTERNS.find((entry) => entry.kind === kind)?.entries ?? null;
 
-// Office 文档 (xlsx/docx/pptx) 都是 zip + XML, 取出相关部件剥掉标签即可。
+// Office 文档 (xlsx/docx/pptx) 都是 zip + XML, 实际的解压与抽取见 office.ts。
 export const officeKindOf = (names: string[]): DocKind => {
   for (const { kind, entries } of XML_ENTRY_PATTERNS) {
     if (names.some((name) => entries.test(name))) return kind;
   }
   return "unknown";
-};
-
-export const xmlPartsToText = (parts: string[]): string => {
-  const joined = parts
-    .join("\n")
-    // <t> 是文本节点; 段落/单元格边界补换行, 避免单元格内容黏成一坨
-    .replace(/<\/(w:p|w:tr|a:p|row|c)>/gi, "\n")
-    .replace(/<(w:br|w:tab|a:br)\b[^>]*\/?>/gi, "\n");
-  return normalizeText(decodeEntities(joined.replace(/<[^>]*>/g, " ")));
 };
 
 export const kindFromContentType = (contentType: string, url: string): DocKind => {

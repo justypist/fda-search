@@ -81,6 +81,9 @@ export interface ContentConfig {
   pdf: boolean;
   office: boolean;
   maxBytes: number;
+  // 单篇正文最多保留多少字符。FDA 的表格附件可提取出数千万字符, 全量进 FTS
+  // 既拖慢索引又没有检索价值, 超出部分直接丢弃。
+  maxTextChars: number;
   // 扫描页的 OCR 引擎:
   //   local  — pdf-inspector 内置 PP-OCRv6 (ONNX, 纯本地 CPU), 实测 2 页约 2.8 秒;
   //   vision — 视觉模型 (.env 的 LLM_*), 单页 20-90 秒且按 token 计费;

@@ -12,7 +12,9 @@ import { batchKeyOf } from "../src/pipeline.ts";
 import { strayFlags, stripSeparators } from "../src/util/args.ts";
 import { parseOpenFdaCursor, formatOpenFdaCursor } from "../src/sources/openfda.ts";
 import { matchesFilter, toSitemapItem } from "../src/sources/sitemap.ts";
-import { decodeEntities, extractHtml, kindFromContentType, normalizeText, officeKindOf, xmlPartsToText } from "../src/content/extract.ts";
+import { decodeEntities, extractHtml, kindFromContentType, normalizeText, officeKindOf } from "../src/content/extract.ts";
+import { extractOfficeText } from "../src/content/office.ts";
+import { zipSync, strToU8 } from "fflate";
 import { buildSearch, buildStats } from "../src/server.ts";
 import { OPENFDA_DATASETS } from "../src/defaults.ts";
 import type { Item, KeywordRule } from "../src/types.ts";
@@ -242,10 +244,45 @@ test("正文提取: Office zip 部件按类型识别", () => {
 });
 
 test("正文提取: Office XML 文本节点抽出, 段落边界保留换行", () => {
-  const xml = `<w:document><w:body><w:p><w:r><w:t>First para</w:t></w:r></w:p><w:p><w:r><w:t>Second &amp; para</w:t></w:r></w:p></w:body></w:document>`;
-  const text = xmlPartsToText([xml]);
+  const docx = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "word/document.xml": strToU8(
+      `<w:document><w:body><w:p><w:r><w:t>First para</w:t></w:r></w:p><w:p><w:r><w:t>Second &amp; para</w:t></w:r></w:p></w:body></w:document>`,
+    ),
+  });
+  const text = extractOfficeText(docx, 1_000_000);
   assert.ok(text.includes("First para") && text.includes("Second & para"), text);
   assert.ok(text.includes("\n"), "段落之间应有换行");
+});
+
+test("回归: Office 流式解压, 跨分块的文本与实体完整保留", () => {
+  // 超过一个 1 MB 分块的文本节点, 以及恰好在块边界附近的实体与裸 "<"。
+  const filler = "x".repeat(1_000_000);
+  const docx = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "word/document.xml": strToU8(
+      `<w:document><w:body><w:p><w:r><w:t>${filler}</w:t></w:r></w:p>` +
+        `<w:p><w:r><w:t>needle &amp; thread</w:t></w:r></w:p>` +
+        `<w:p><w:r><w:t>a &lt; b 5</w:t></w:r></w:p></w:body></w:document>`,
+    ),
+  });
+  const text = extractOfficeText(docx, 3_000_000);
+  assert.ok(text.length > 1_000_000, `应跨过分块, 实得 ${text.length}`);
+  assert.ok(text.includes("needle & thread"), "跨块的实体不能丢");
+  assert.ok(text.includes("a < b 5"), "转义的尖括号应还原为文字");
+});
+
+test("回归: xlsx 优先保留 sharedStrings, 单元格索引不挤占文字", () => {
+  const rows = Array.from({ length: 2000 }, (_, i) => `<row r="${i + 1}"><c t="s"><v>${i}</v></c></row>`).join("");
+  const strings = Array.from({ length: 2000 }, (_, i) => `<si><t>Listeria sample ${i}</t></si>`).join("");
+  const xlsx = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "xl/worksheets/sheet1.xml": strToU8(`<worksheet><sheetData>${rows}</sheetData></worksheet>`),
+    "xl/sharedStrings.xml": strToU8(`<sst>${strings}</sst>`),
+  });
+  const text = extractOfficeText(xlsx, 200_000);
+  assert.ok(text.startsWith("Listeria sample 0"), `文字应排在索引之前, 实得 ${text.slice(0, 40)}`);
+  assert.ok(text.includes("Listeria sample 1999") || text.length >= 200_000, "文字部分不应被索引挤掉");
 });
 
 // --- 正文抓取的排序与 lastmod 刷新 ---
@@ -409,4 +446,17 @@ test("回归: pnpm 传入的 `--` 不能被当成位置参数, 否则开关全�
   assert.deepEqual(stripSeparators(["collect", "--stage", "content"]), ["collect", "--stage", "content"], "无分隔符时不变");
   assert.deepEqual(strayFlags(["--stage", "content"]), ["--stage"], "漏网的开关必须能被识别");
   assert.deepEqual(strayFlags(["collect"]), [], "正常位置参数不应误报");
+});
+
+test("回归: 无论 sheet 还是 sharedStrings 先到, 都不挤掉文字", () => {
+  // zip 内部件顺序由打包方式决定, 两种顺序都要能取到 sharedStrings。
+  const strings = strToU8(`<sst>${Array.from({ length: 500 }, (_, i) => `<si><t>Listeria ${i}</t></si>`).join("")}</sst>`);
+  const sheet = strToU8(`<worksheet><sheetData>${Array.from({ length: 500 }, (_, i) => `<row r="${i + 1}"><c t="s"><v>${i}</v></c></row>`).join("")}</sheetData></worksheet>`);
+  for (const order of [
+    { "[Content_Types].xml": strToU8("<Types/>"), "xl/worksheets/sheet1.xml": sheet, "xl/sharedStrings.xml": strings },
+    { "[Content_Types].xml": strToU8("<Types/>"), "xl/sharedStrings.xml": strings, "xl/worksheets/sheet1.xml": sheet },
+  ]) {
+    const text = extractOfficeText(zipSync(order), 10_000);
+    assert.ok(text.includes("Listeria 0") && text.includes("Listeria 499"), `部件顺序不应影响文字提取, 实得 ${text.slice(0, 80)}`);
+  }
 });
