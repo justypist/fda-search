@@ -26,7 +26,11 @@
     "reset": "node src/cli.ts reset",
     "bulk": "node src/cli.ts bulk",
     "serve": "node src/cli.ts serve",
-    "ocr:setup": "bash scripts/setup-ocr.sh"
+    "ocr:setup": "bash scripts/setup-ocr.sh",
+    "backup": "node src/archive.ts backup",
+    "backup:upload": "node src/archive.ts upload",
+    "backup:download": "node src/archive.ts download",
+    "backup:restore": "node src/archive.ts restore"
   },
   "keywords": [],
   "author": "",

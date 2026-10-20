@@ -224,7 +224,7 @@ pnpm run content:full --verbose    # 建议放在 tmux 里, 中断后重跑会�
 | `pnpm run collect --verbose` (= `pnpm run collect:verbose`) | 同上, 输出每个通道的明细与进度 |
 | `pnpm run collect:full` | 全通道 + 忽略条件请求缓存 + 解除正文批数限制 |
 | `pnpm run status` | 运行历史 / 游标 / 队列 / 正文库统计 |
-| `pnpm run serve` | 启动本地搜索界面 (http://127.0.0.1:8787) |
+| `pnpm run serve` | 启动本地搜索界面 (http://127.0.0.1:8787, 默认监听所有网卡) |
 | `pnpm run search <关键词>` | 在已落库条目中检索 (标题 / 摘要 / URL) |
 | `pnpm run recall <关键词>` | 在正文库中全文检索 (FTS5) |
 | `pnpm run alerts` | 历史告警 |
@@ -247,6 +247,10 @@ pnpm run content:full --verbose    # 建议放在 tmux 里, 中断后重跑会�
 | `pnpm run bulk` | 走 openFDA 官方批量下载通道补历史 |
 | `pnpm run reset` | 清除正文库里的假失败 (403/429/超体积), 让它们重新待抓 |
 | `pnpm run ocr:setup` | 安装本地 OCR 运行时 (PDFium + ONNX Runtime) |
+| `pnpm run backup` | 生成一致性快照, 压缩并按 GitHub Release 附件大小分卷 |
+| `pnpm run backup:upload` | 把分卷传到 GitHub Release |
+| `pnpm run backup:download` | 从 GitHub Release 下载分卷 |
+| `pnpm run backup:restore` | 校验分卷并还原为 `data/fda-monitor.db` |
 | `pnpm test` | 单元测试 (node:test, 不联网) |
 | `pnpm run typecheck` | 类型检查 |
 
@@ -260,9 +264,46 @@ pnpm run content:full --verbose    # 建议放在 tmux 里, 中断后重跑会�
 `fflate` (Office 文档解压)。本地 OCR 另需 `pnpm run ocr:setup` 安装运行时库,
 视觉引擎则需 `.env` 配置, 见下文"正文通道"。
 
+### 备份与迁移
+
+整库 (元数据 + 正文 + FTS 索引) 都在 `data/fda-monitor.db` 一个文件里, 迁移不带 `-wal` / `-shm`。
+默认走 GitHub Release 分卷: 免费账号的 Release 附件不限总量与带宽, 单文件上限 2 GiB,
+因此按 1.85 GiB 切卷, 14 GB 的库压缩后约 6.2 GiB, 4 卷。
+
+```bash
+# 源机: 快照 -> zstd -> 分卷 (serve / collect 运行时也能跑, 走 sqlite 在线备份)
+pnpm run backup
+
+# 源机: 建 Release 并上传分卷与 manifest.json
+pnpm run backup:upload
+
+# 目标机: 下载 -> 校验 sha256 -> 还原 (自动清掉旧的 -wal/-shm 与 collect.lock)
+pnpm run backup:download
+pnpm run backup:restore
+```
+
+选项 (以 `--` 传给 pnpm, 或直接 `node src/archive.ts <命令> <选项>`):
+
+| 选项 | 说明 |
+| --- | --- |
+| `--dir <路径>` | 备份目录, 默认 `./data/backup` |
+| `--repo <owner/repo>` | GitHub 仓库, 默认按 `github` -> `origin` 顺序从 git remote 推断 |
+| `--tag <名称>` | Release 标签, 默认 `snapshot-YYYY-MM-DD` |
+| `--part <大小>` | 每卷字节数, 支持 `500M` / `2G`, 默认 `1.85G` |
+| `--level <n>` | zstd 级别 1-19, 默认 3 |
+| `--store` | 不压缩直接分卷 (14 GB, 仅内网或本地传输时用) |
+| `--force` | 覆盖已有备份目录 / 目标库 / Release 附件 |
+
+`manifest.json` 记录库体积、压缩包 sha256、每卷体积与表行数。`restore` 会依次校验
+分卷齐整、合并后字节数、sha256、`PRAGMA integrity_check` 和正文行数, 任一项不符即中止,
+不会留下半截数据库。备份目录跨文件系统时, 还原先复制到目标目录再原子改名。
+
+> 上传前会检查仓库可见性: `justypist/fda-search` 当前是 **public**, Release 附件会随仓库公开
+> 分发 8.6 万篇 FDA 正文与告警记录。不想公开就先 `gh repo edit --visibility private`。
+
 ### 本地搜索界面
 
-`pnpm run serve` 起一个只监听 `127.0.0.1` 的小服务, 用来查"本地索引到了什么"。两种模式:
+`pnpm run serve` 起一个小服务 (默认监听 `0.0.0.0:8787`, 局域网可访问; 只想本机使用时加 `--host 127.0.0.1`), 用来查"本地索引到了什么"。两种模式:
 
 | 模式 | 索引 | 能搜到 |
 | --- | --- | --- |
