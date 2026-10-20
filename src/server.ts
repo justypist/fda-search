@@ -132,7 +132,7 @@ const sendText = (res: ServerResponse, status: number, body: string, type: strin
  * Search.gov 的 affiliate=fda 结果页显示 "turned off"), 因此需要一个能查本地
  * 索引的界面, 用来看"我们索引到了什么"。
  *
- * 只监听回环地址: 数据在本地 SQLite 里, 没有对外的必要, 也不该暴露。
+ * 默认监听 0.0.0.0 以便局域网访问, 用 --host 127.0.0.1 可收回本机。
  */
 export const serve = (store: Store, options: ServeOptions): Promise<Server> =>
   new Promise((resolve, reject) => {

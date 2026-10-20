@@ -21,7 +21,7 @@ const USAGE = `FDA 变更监听
 命令:
   collect              拉取各通道并把新条目落库, 命中关键词时输出
   bulk                 走 openFDA 官方批量下载通道补历史 (不受 API 配额限制)
-  serve                启动本地搜索界面 (只监听回环地址)
+  serve                启动本地搜索界面 (监听所有网卡, 局域网可访问)
   status               显示运行历史、游标、队列与库内统计
   alerts               列出历史告警
   search <关键词>      在已落库条目中检索
@@ -37,6 +37,7 @@ const USAGE = `FDA 变更监听
       --dataset <名称> bulk 限定数据集, 可重复 (默认取配置)
       --limit <n>      bulk 单轮最多下多少个分区 / serve 单页结果上限
       --port <n>       serve 监听端口 (默认 8787)
+      --host <addr>    serve 监听地址 (默认 0.0.0.0, 仅本机可用 127.0.0.1)
   -v, --verbose        输出每个通道的明细
   -h, --help           显示帮助
 
@@ -53,6 +54,7 @@ interface CliOptions {
   datasets: string[];
   limit: number | null;
   port: number | null;
+  host: string;
   verbose: boolean;
   json: boolean;
 }
@@ -71,6 +73,7 @@ const parse = (argv: string[]): CliOptions => {
       dataset: { type: "string", multiple: true, default: [] },
       limit: { type: "string" },
       port: { type: "string" },
+      host: { type: "string", default: "0.0.0.0" },
       verbose: { type: "boolean", short: "v", default: false },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -115,6 +118,7 @@ const parse = (argv: string[]): CliOptions => {
     datasets: values.dataset ?? [],
     limit,
     port,
+    host: values.host ?? "0.0.0.0",
     verbose: values.verbose === true,
     json: values.json === true,
   };
@@ -259,9 +263,9 @@ const main = async (): Promise<number> => {
       }
       case "serve": {
         const port = options.port ?? 8787;
-        const server = await serve(store, { port, host: "127.0.0.1", limit: options.limit ?? 50 });
+        const server = await serve(store, { port, host: options.host, limit: options.limit ?? 50 });
         const counts = store.counts();
-        process.stdout.write(`本地搜索界面: http://127.0.0.1:${port}\n`);
+        process.stdout.write(`本地搜索界面: http://${options.host}:${port}\n`);
         process.stdout.write(
           `索引 ${counts.items} 条元数据, 正文 ${store.documentStats().ok} 篇${store.ftsEnabled ? "" : " (FTS5 不可用)"}\n`,
         );
